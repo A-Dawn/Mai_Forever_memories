@@ -7,7 +7,7 @@
     "name": "ARC",
     "url": "https://github.com/ARC" 
   },
-  "license": "MIT",
+  "license": "AGPL-v3.0-or-later",
   "host_application": {
     "min_version": "0.11.7"
   },
@@ -62,5 +62,5 @@
       "性能监控与管理员告警"
     ]
   },
-  "id": "ARC.MaiForeverMemories"
+  "id": "A-Dawn.MaiForeverMemories"
 }
