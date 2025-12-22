@@ -1,0 +1,66 @@
+{
+  "manifest_version": 1,
+  "name": "Mai Forever Memories",
+  "version": "0.1.0",
+  "description": "将你与麦麦日常生活中的一点一滴保存为永恒的记忆，记录到LPMM中",
+  "author": {
+    "name": "ARC",
+    "url": "https://github.com/ARC" 
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.11.7"
+  },
+  "homepage_url": "https://github.com/A-Dawn/Mai_Forever_memories",
+  "repository_url": "https://github.com/A-Dawn/Mai_Forever_memories",
+  "keywords": [
+    "memory",
+    "lpmm",
+    "summary",
+    "knowledge"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "default_locale": "zh-CN",
+  "locales_path": "_locales",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "general",
+    "components": [
+      {
+        "type": "event_handler",
+        "name": "memories_startup",
+        "description": "启动时启动摘要调度"
+      },
+      {
+        "type": "event_handler",
+        "name": "memories_stop",
+        "description": "停止时停止摘要调度"
+      },
+      {
+        "type": "event_handler",
+        "name": "memories_forever_trigger",
+        "description": "自然语言触发永远记忆（关键词触发）"
+      },
+      {
+        "type": "action",
+        "name": "memories_forever_action",
+        "description": "通过 Action 激活永远的记忆（关键词触发）"
+      },
+      {
+        "type": "command",
+        "name": "memories",
+        "description": "管理定时聊天摘要与记忆的命令",
+        "pattern": "^/memories(?:\\s+(?P<action>[a-zA-Z_]+))?(?:\\s+(?P<arg>\\S+))?$"
+      }
+    ],
+    "features": [
+      "每日/每周摘要",
+      "永远记忆触发",
+      "导入 LPMM 知识库",
+      "性能监控与管理员告警"
+    ]
+  },
+  "id": "ARC.MaiForeverMemories"
+}

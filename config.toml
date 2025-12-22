@@ -1,0 +1,58 @@
+#在使用此插件之前请务必注意！如果你是由于麦麦部署环境性能羸弱，将知识库在其他设备上生成并迁移到部署机的话，请谨慎使用本插件！
+#本插件在进行知识库处理时会进行导入/删除工作，可能对低配置服务端造成严重影响！
+
+
+[plugin]
+config_version = "1.0.0" # 配置版本
+enabled = false # 启用插件
+
+[schedule]
+timezone = "Asia/Shanghai" # IANA 时区或 'local'
+daily_time = "11:30" # 每日触发时间 HH:MM
+weekly_day = "sun" # 每周触发日期 mon..sun
+weekly_time = "11:45" # 每周触发时间 HH:MM
+enable_weekly = true # 启用每周摘要
+
+[streams]
+mode = "all" # 模式: all (处理所有流)，allow (仅处理 allowlist 中列出的流：白名单)，deny (处理除 denylist 以外的流：黑名单)
+allowlist = ["qq:123456789:private", "qq:987654321:group"] # 允许的流 ID 列表 (chat stream_id)，示例: "platform:id:private|group"
+denylist = ["qq:111222333:group"] # 拒绝的流 ID 列表 (chat stream_id)，示例: "platform:id:private|group"
+include_group = true # 包含群聊
+include_private = true # 包含私聊
+
+[summary]
+task = "utils" # 模型任务名称
+min_messages = 8 # 触发摘要的最小消息数
+max_input_chars = 8000 # 最大输入字符数
+daily_max_chars = 800 # 每日摘要长度
+weekly_max_chars = 1200 # 每周摘要长度
+level2_max_chars = 1600 # 最终压缩摘要长度
+forever_max_chars = 1000 # “永远的记忆”摘要长度
+temperature = 0.3 # LLM 温度
+filter_bot = false # 过滤机器人消息
+filter_command = true # 过滤命令消息
+truncate_messages = true # 截断长消息
+
+[forever]
+enabled = true # 启用自然语言触发“永远的记忆”
+use_action = true # 启用 Action 模式触发永远的记忆
+keywords = ["请记住我们之间说的话哦", "一定不要忘记哦，一定不要", "永远不要忘记我们说的话哦"] # 触发关键词
+lookback_messages = 20 # 向上回溯的消息数量
+
+[capacity]
+max_paragraphs = 200 # 最大存储摘要数
+max_nodes = 0 # 最大 KG 节点数 (0 禁用最大节点限制)
+enable_level2 = true # 允许最终压缩
+
+[paths]
+data_dir = "data/lpmm_summary" # 数据目录
+
+[performance]
+enabled = true # 启用性能检测
+max_cpu_percent = 80.0 # CPU 占用率阈值 (%)
+max_memory_percent = 85.0 # 内存占用率阈值 (%)
+admin_id = "qq:123456789:private" # 管理员标识: stream_id / platform:ID:private|group / 用户 ID
+alert_interval = 3600 # 告警间隔 (秒)
+
+[commands]
+enabled = true # 启用 /memories 命令
