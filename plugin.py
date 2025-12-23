@@ -6,6 +6,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as ProcessTimeoutError
 
 try:
     import psutil
@@ -47,6 +48,44 @@ logger = get_logger("mai_forever_memories")
 
 _plugin_instance = None
 
+
+def _process_rebuild_and_build_kg(raw_paragraphs: dict, triple_list_data: dict) -> bool:
+    """在子进程中执行的重建和 KG 构建任务（避免把大内存/CPU 操作留在主进程线程）。"""
+    try:
+        from src.chat.knowledge.embedding_store import EmbeddingManager
+        from src.chat.knowledge.kg_manager import KGManager
+
+        embed_manager = EmbeddingManager()
+        try:
+            embed_manager.load_from_file()
+        except Exception:
+            # 允许首次导入时不存在文件
+            pass
+
+        kg_manager = KGManager()
+        try:
+            kg_manager.load_from_file()
+        except Exception:
+            pass
+
+        # 存储并重建索引
+        embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
+        embed_manager.rebuild_faiss_index()
+        embed_manager.save_to_file()
+
+        # 构建 KG 并保存
+        kg_manager.build_kg(triple_list_data, embed_manager)
+        kg_manager.save_to_file()
+
+        return True
+    except Exception as exc:
+        # 子进程中发生异常，通过日志收集（主进程会捕获future.exception()）
+        import traceback
+
+        print("子进程执行重建/构建失败:", exc)
+        traceback.print_exc()
+        return False
+
 DAY_SECONDS = 24 * 60 * 60
 WEEK_SECONDS = 7 * DAY_SECONDS
 
@@ -63,6 +102,36 @@ def _sanitize_filename(value: str) -> str:
 
 def _now_ts() -> float:
     return time.time()
+
+
+def _extract_message_content(message) -> str:
+    """兼容多种消息对象，提取文本内容的通用方法。"""
+    if not message:
+        return ""
+    # 常见字段优先级
+    for key in ("content", "plain_text", "processed_plain_text", "raw_message", "message", "message_text"):
+        try:
+            val = getattr(message, key, None)
+        except Exception:
+            val = None
+        if val:
+            return str(val)
+
+    # 支持 MaiMessages.message_segments（尝试拼接段文本）
+    segs = getattr(message, "message_segments", None)
+    if segs:
+        parts = []
+        try:
+            for s in segs:
+                p = getattr(s, "text", None) or getattr(s, "plain_text", None) or str(s)
+                if p:
+                    parts.append(str(p))
+            if parts:
+                return " ".join(parts)
+        except Exception:
+            pass
+
+    return ""
 
 
 class MemoriesStartupHandler(BaseEventHandler):
@@ -93,9 +162,13 @@ class MemoriesForeverHandler(BaseEventHandler):
     handler_description = "自然语言触发永远的记忆"
 
     async def execute(self, message: MaiMessages | None):
-        if not _plugin_instance or not message or not message.content:
+        if not _plugin_instance or not message:
             return True, True, None, None, None
-        
+        # 兼容不同消息对象，提取文本内容
+        content = _extract_message_content(message).strip()
+        if not content:
+            return True, True, None, None, None
+
         if not _plugin_instance.get_config("forever.enabled", True):
             return True, True, None, None, None
         
@@ -105,7 +178,6 @@ class MemoriesForeverHandler(BaseEventHandler):
             return True, True, None, None, None
         
         keywords = _plugin_instance.get_config("forever.keywords", ["记住这段", "记住刚才"])
-        content = message.content.strip()
         
         if any(kw in content for kw in keywords):
             # 触发"永远的记忆"
@@ -209,7 +281,7 @@ class MemoriesCommand(BaseCommand):
             stream_id = None
             if self.message.chat_stream and hasattr(self.message.chat_stream, "stream_id"):
                 stream_id = self.message.chat_stream.stream_id
-            status = _plugin_instance.build_status_text(chat_id=stream_id)
+            status = await _plugin_instance.build_status_text(chat_id=stream_id)
             await self.send_text(status, storage_message=False)
             return True, None, False
 
@@ -217,7 +289,7 @@ class MemoriesCommand(BaseCommand):
             stream_id = None
             if self.message.chat_stream and hasattr(self.message.chat_stream, "stream_id"):
                 stream_id = self.message.chat_stream.stream_id
-            text = _plugin_instance.get_recent_entries_text(chat_id=stream_id)
+            text = await _plugin_instance.get_recent_entries_text(chat_id=stream_id)
             await self.send_text(text, storage_message=False)
             return True, None, False
 
@@ -225,7 +297,7 @@ class MemoriesCommand(BaseCommand):
             if not arg:
                 await self.send_text("请提供摘要 ID。用法: /memories show <ID>", storage_message=False)
                 return False, None, False
-            text = _plugin_instance.get_entry_text(arg)
+            text = await _plugin_instance.get_entry_text(arg)
             await self.send_text(text, storage_message=False)
             return True, None, False
 
@@ -379,6 +451,13 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 任务跟踪集合：用于跟踪所有后台任务，防止任务泄漏
         self._background_tasks: set[asyncio.Task] = set()
         self._tasks_lock = asyncio.Lock()
+        # 限制并发的重型后台任务（如导入、索引重建）
+        self._heavy_semaphore = asyncio.Semaphore(2)
+        # 进程池，用于隔离 CPU/内存密集型的索引/图构建任务
+        try:
+            self._process_pool = ProcessPoolExecutor(max_workers=1)
+        except Exception:
+            self._process_pool = None
         # KG 节点计数缓存（避免重复加载）
         self._cached_node_count: int | None = None
         self._node_count_cache_time: float = 0.0
@@ -652,6 +731,15 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     await asyncio.gather(*active_tasks, return_exceptions=True)
                 self._background_tasks.clear()
                 logger.info("所有后台任务已清理")
+        # 关闭进程池（如果存在），避免子进程遗留
+        try:
+            if getattr(self, "_process_pool", None):
+                try:
+                    self._process_pool.shutdown(wait=False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         logger.info("记忆调度器已停止。")
 
@@ -769,8 +857,10 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             return daily
         return daily if daily <= weekly else weekly
 
-    def build_status_text(self, chat_id: str | None = None) -> str:
-        state = self._load_state_sync()
+    async def build_status_text(self, chat_id: str | None = None) -> str:
+        # 在异步上下文中调用此方法时请使用 await build_status_text(...)
+        # 使用线程执行磁盘 I/O 以避免阻塞事件循环
+        state = await asyncio.to_thread(self._load_state_sync)
         tz = self._get_timezone()
         now = datetime.now(tz)
         next_daily = self._next_daily_time(now)
@@ -807,8 +897,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             )
         return "\n".join(lines)
 
-    def get_recent_entries_text(self, chat_id: str | None = None, limit: int = 10) -> str:
-        state = self._load_state_sync()
+    async def get_recent_entries_text(self, chat_id: str | None = None, limit: int = 10) -> str:
+        state = await asyncio.to_thread(self._load_state_sync)
         tz = self._get_timezone()
         entries = [e for e in state["entries"] if not e.get("deleted")]
         if chat_id:
@@ -829,8 +919,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         lines.append("\n使用 /memories show <ID> 查看详情。")
         return "\n".join(lines)
 
-    def get_entry_text(self, entry_id: str) -> str:
-        state = self._load_state_sync()
+    async def get_entry_text(self, entry_id: str) -> str:
+        state = await asyncio.to_thread(self._load_state_sync)
         entry = next((e for e in state["entries"] if e.get("id") == entry_id), None)
         if not entry:
             return f"未找到 ID 为 {entry_id} 的条目。"
@@ -847,7 +937,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             return f"原始文件不存在: {raw_file}"
         
         try:
-            content = path.read_text(encoding="utf-8")
+            content = await asyncio.to_thread(path.read_text, "utf-8")
             return f"摘要详情 ({entry_id}):\n\n{content}"
         except Exception as exc:
             return f"读取文件失败: {exc}"
@@ -1054,7 +1144,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         logger.info("已生成摘要 (%s)，使用模型 %s。", title, model_name)
         return summary
 
-    def _build_entries_text(self, entries: list[dict], tz) -> str:
+    async def _build_entries_text(self, entries: list[dict], tz) -> str:
         lines = []
         for entry in entries:
             raw_file = entry.get("raw_file")
@@ -1063,7 +1153,11 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             path = self._resolve_entry_path(raw_file)
             if not path.exists():
                 continue
-            text = path.read_text(encoding="utf-8").strip()
+            try:
+                text = await asyncio.to_thread(path.read_text, "utf-8")
+            except Exception:
+                continue
+            text = text.strip()
             created_at = float(entry.get("created_at", 0) or 0)
             if tz:
                 date_label = datetime.fromtimestamp(created_at, tz).strftime("%Y-%m-%d")
@@ -1104,7 +1198,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         
         # 写入原始文件，添加错误处理
         try:
-            raw_path.write_text(full_text.strip() + "\n", encoding="utf-8")
+            await asyncio.to_thread(raw_path.write_text, full_text.strip() + "\n", "utf-8")
         except Exception as exc:
             logger.error("写入原始文件失败: %s, 路径: %s", exc, raw_path, exc_info=True)
             return None
@@ -1114,9 +1208,11 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         if not ok:
             # 清理已写入的文件，避免残留
             try:
-                if raw_path.exists():
-                    raw_path.unlink()
-                    logger.debug("已清理失败的原始文件: %s", raw_path)
+                def _cleanup():
+                    if raw_path.exists():
+                        raw_path.unlink()
+                await asyncio.to_thread(_cleanup)
+                logger.debug("已清理失败的原始文件: %s", raw_path)
             except Exception as cleanup_exc:
                 logger.warning("清理失败文件时出错: %s", cleanup_exc)
             return None
@@ -1164,94 +1260,135 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         return True
 
     async def _import_raw_summary(self, raw_path: Path, openie_path: Path) -> bool:
-        """内部实现信息提取与导入，不再依赖外部脚本的命令行参数。"""
+        """内部实现信息提取与导入，不再依赖外部脚本的命令行参数。
+        为避免在事件循环中阻塞，将耗时的同步工作封装到线程中执行。
+        """
+        # 限制并发，避免线程池被大量耗尽
+        acquired = False
         try:
-            # 1. 读取原始文本
-            text = raw_path.read_text(encoding="utf-8").strip()
-            if not text:
-                return False
-
-            # 2. 初始化 LLM 请求
-            ner_llm = LLMRequest(
-                model_set=model_config.model_task_config.lpmm_entity_extract,
-                request_type="memories.lpmm.ner",
-            )
-            rdf_llm = LLMRequest(
-                model_set=model_config.model_task_config.lpmm_rdf_build,
-                request_type="memories.lpmm.rdf",
-            )
-
-            # 3. 执行信息提取
-            entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
-            if entities is None or triples is None:
-                logger.error("LPMM 信息提取失败。")
-                return False
-
-            # 4. 构建 OpenIE 对象并保存中间文件
-            pg_hash = get_sha256(text)
-            doc_item = {
-                "idx": pg_hash,
-                "passage": text,
-                "extracted_entities": entities,
-                "extracted_triples": triples,
-            }
-            
-            sum_chars = sum(len(e) for e in entities)
-            sum_words = sum(len(e.split()) for e in entities)
-            num_ent = len(entities)
-            avg_chars = round(sum_chars / num_ent, 4) if num_ent else 0
-            avg_words = round(sum_words / num_ent, 4) if num_ent else 0
-            
-            openie_obj = OpenIE([doc_item], avg_chars, avg_words)
-            try:
-                openie_path.write_text(
-                    json.dumps(openie_obj.__dict__, ensure_ascii=False, indent=4),
-                    encoding="utf-8"
-                )
-            except Exception as exc:
-                logger.error("写入 OpenIE 文件失败: %s, 路径: %s", exc, openie_path, exc_info=True)
-                return False
-
-            # 5. 导入到向量库与知识图谱
-            embed_manager = EmbeddingManager()
-            try:
-                embed_manager.load_from_file()
-            except Exception as exc:
-                logger.warning("加载 EmbeddingManager 失败: %s", exc, exc_info=True)
-                # 继续执行，可能是首次运行
-
-            kg_manager = KGManager()
-            try:
-                kg_manager.load_from_file()
-            except Exception as exc:
-                logger.warning("加载 KGManager 失败: %s", exc, exc_info=True)
-                # 继续执行，可能是首次运行
-
-            paragraph_key = f"paragraph-{pg_hash}"
-            if (paragraph_key in embed_manager.stored_pg_hashes and 
-                pg_hash in kg_manager.stored_paragraph_hashes):
-                logger.info("段落已存在于知识库中，跳过导入。")
-                return True
-
-            raw_paragraphs = {pg_hash: text}
-            triple_list_data = {pg_hash: triples}
-            
-            embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
-            embed_manager.rebuild_faiss_index()
-            embed_manager.save_to_file()
-            
-            kg_manager.build_kg(triple_list_data, embed_manager)
-            kg_manager.save_to_file()
-            
-            # 使节点计数缓存失效，下次获取时会重新计算
-            self._invalidate_node_count_cache()
-
-            logger.info("成功将摘要导入 LPMM 知识库。")
-            return True
-
+            await self._heavy_semaphore.acquire()
+            acquired = True
+            return await asyncio.to_thread(self._import_raw_summary_blocking, raw_path, openie_path)
         except Exception as e:
             logger.error("导入摘要到 LPMM 时发生异常: %s", e, exc_info=True)
             return False
+        finally:
+            if acquired:
+                try:
+                    self._heavy_semaphore.release()
+                except Exception:
+                    pass
+
+    def _import_raw_summary_blocking(self, raw_path: Path, openie_path: Path) -> bool:
+        """同步、阻塞式的导入实现，供后台线程执行。"""
+        # 1. 读取原始文本
+        try:
+            text = raw_path.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.error("读取原始文件失败: %s, 路径: %s", e, raw_path, exc_info=True)
+            return False
+        if not text:
+            return False
+
+        # 2. 初始化 LLM 请求
+        ner_llm = LLMRequest(
+            model_set=model_config.model_task_config.lpmm_entity_extract,
+            request_type="memories.lpmm.ner",
+        )
+        rdf_llm = LLMRequest(
+            model_set=model_config.model_task_config.lpmm_rdf_build,
+            request_type="memories.lpmm.rdf",
+        )
+
+        # 3. 执行信息提取（可能包含重试与 time.sleep）
+        entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
+        if entities is None or triples is None:
+            logger.error("LPMM 信息提取失败。")
+            return False
+
+        # 4. 构建 OpenIE 对象并保存中间文件
+        pg_hash = get_sha256(text)
+        doc_item = {
+            "idx": pg_hash,
+            "passage": text,
+            "extracted_entities": entities,
+            "extracted_triples": triples,
+        }
+
+        sum_chars = sum(len(e) for e in entities)
+        sum_words = sum(len(e.split()) for e in entities)
+        num_ent = len(entities)
+        avg_chars = round(sum_chars / num_ent, 4) if num_ent else 0
+        avg_words = round(sum_words / num_ent, 4) if num_ent else 0
+
+        openie_obj = OpenIE([doc_item], avg_chars, avg_words)
+        try:
+            openie_path.write_text(
+                json.dumps(openie_obj.__dict__, ensure_ascii=False, indent=4),
+                encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.error("写入 OpenIE 文件失败: %s, 路径: %s", exc, openie_path, exc_info=True)
+            return False
+
+        # 5. 导入到向量库与知识图谱
+        embed_manager = EmbeddingManager()
+        try:
+            embed_manager.load_from_file()
+        except Exception as exc:
+            logger.warning("加载 EmbeddingManager 失败: %s", exc, exc_info=True)
+            # 继续执行，可能是首次运行
+
+        kg_manager = KGManager()
+        try:
+            kg_manager.load_from_file()
+        except Exception as exc:
+            logger.warning("加载 KGManager 失败: %s", exc, exc_info=True)
+            # 继续执行，可能是首次运行
+
+        paragraph_key = f"paragraph-{pg_hash}"
+        if (paragraph_key in embed_manager.stored_pg_hashes and
+            pg_hash in kg_manager.stored_paragraph_hashes):
+            logger.info("段落已存在于知识库中，跳过导入。")
+            return True
+
+        raw_paragraphs = {pg_hash: text}
+        triple_list_data = {pg_hash: triples}
+
+        # 尝试在进程池中执行索引重建与 KG 构建，以隔离内存和 CPU 密集型工作
+        processed_ok = False
+        try:
+            if getattr(self, "_process_pool", None):
+                future = self._process_pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                try:
+                    # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
+                    processed_ok = future.result(timeout=300)
+                except ProcessTimeoutError:
+                    logger.warning("子进程重建/构建超时，转回线程内执行")
+                except Exception as e:
+                    logger.warning("子进程重建/构建失败: %s", e)
+
+        except Exception as exc:
+            logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
+
+        # 如果子进程执行失败或不可用，则回退到线程内执行（兼容性保障）
+        if not processed_ok:
+            embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
+            embed_manager.rebuild_faiss_index()
+            embed_manager.save_to_file()
+
+            kg_manager.build_kg(triple_list_data, embed_manager)
+            kg_manager.save_to_file()
+
+        # 使节点计数缓存失效，下次获取时会重新计算
+        try:
+            self._invalidate_node_count_cache()
+        except Exception:
+            # 在后台线程中调用实例方法，保护性捕获异常
+            logger.debug("后台线程调用 _invalidate_node_count_cache 失败", exc_info=True)
+
+        logger.info("成功将摘要导入 LPMM 知识库。")
+        return True
 
     async def _run_due(self) -> None:
         if not self._is_enabled():
@@ -1544,7 +1681,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     changed = True
                     continue
                 daily_entries = daily_entries[-MIN_WEEKLY_DAILY_ENTRIES:]
-                entries_text = self._build_entries_text(daily_entries, tz)
+                entries_text = await self._build_entries_text(daily_entries, tz)
                 if not entries_text:
                     state["last_weekly_run"][chat_id] = end_ts
                     changed = True
@@ -1586,8 +1723,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             if is_dangerous:
                 await self._alert_admin(desc)
 
-    def _get_node_count(self, force_refresh: bool = False) -> int:
-        """获取 KG 节点数，使用缓存避免重复加载。"""
+    async def _get_node_count(self, force_refresh: bool = False) -> int:
+        """获取 KG 节点数，使用缓存避免重复加载。此方法为异步，内部在后台线程执行阻塞 I/O。"""
         if not self._lpmm_enabled():
             return 0
         
@@ -1597,12 +1734,15 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             self._cached_node_count is not None and 
             now - self._node_count_cache_time < self._node_count_cache_ttl):
             return self._cached_node_count
-        
-        # 刷新缓存
+
+        # 刷新缓存（在后台线程中执行阻塞操作）
         try:
-            kg_manager = KGManager()
-            kg_manager.load_from_file()
-            count = len(kg_manager.graph.get_node_list())
+            def _load_count():
+                kg_manager = KGManager()
+                kg_manager.load_from_file()
+                return len(kg_manager.graph.get_node_list())
+
+            count = await asyncio.to_thread(_load_count)
             self._cached_node_count = count
             self._node_count_cache_time = now
             logger.debug("KG 节点数已更新: %d", count)
@@ -1665,7 +1805,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         nodes_exceeded = False
         node_count = 0
         if max_nodes > 0:
-            node_count = self._get_node_count()
+            node_count = await self._get_node_count()
             nodes_exceeded = node_count > max_nodes
 
         # 注意：这里判断是否超限时，通常是看总数，但删除时只删 candidates
@@ -1700,7 +1840,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             
             # 如果是因为节点数超限而删除，重新检查节点数
             if nodes_exceeded and max_nodes > 0:
-                node_count = self._get_node_count()
+                node_count = await self._get_node_count()
                 nodes_exceeded = node_count > max_nodes
 
         still_exceeded = False
@@ -1765,7 +1905,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     active_entries = [e for e in state["entries"] if not e.get("deleted")]
                     cleanup_candidates = [e for e in active_entries if e.get("level", 0) < 3]
                     # 重新检查节点数
-                    node_count = self._get_node_count()
+                    node_count = await self._get_node_count()
                     nodes_exceeded = node_count > max_nodes
                 else:
                     break
@@ -1810,7 +1950,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         tz = self._get_timezone()
         max_input_chars = int(self.get_config("summary.max_input_chars", 8000))
         level2_max_chars = int(self.get_config("summary.level2_max_chars", 1600))
-        entries_text = self._build_entries_text(selected_entries, tz)
+        entries_text = await self._build_entries_text(selected_entries, tz)
         entries_text = self._truncate_text(entries_text, max_input_chars)
         summary = await self._summarize_text(entries_text, level2_max_chars, "level2")
         if not summary:
