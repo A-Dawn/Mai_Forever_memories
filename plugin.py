@@ -81,6 +81,12 @@ def _process_rebuild_and_build_kg(raw_paragraphs: dict, triple_list_data: dict) 
         traceback.print_exc()
         return False
 
+
+try:
+    _process_rebuild_and_build_kg.__module__ = __name__
+except Exception:
+    pass
+
 DAY_SECONDS = 24 * 60 * 60
 WEEK_SECONDS = 7 * DAY_SECONDS
 
@@ -1504,8 +1510,29 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             from concurrent.futures import ProcessPoolExecutor as _LocalPPE
             # 为保证子进程在任务完成后退出，这里按任务创建进程池（上下文管理）
             try:
+                # 在提交前记录函数和模块信息，便于诊断 Pickling/导入问题
+                logger.debug(
+                    "准备提交子进程任务: func=%s module=%s",
+                    getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>"),
+                    getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>"),
+                )
                 with _LocalPPE(max_workers=1) as pool:
-                    future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                    try:
+                        future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                    except Exception as submit_exc:
+                        # 捕获提交阶段的序列化/导入相关错误并记录详细信息
+                        try:
+                            func_mod = getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>")
+                            func_name = getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>")
+                            logger.warning(
+                                "提交子进程任务失败（序列化或导入问题），func=%s module=%s error=%s",
+                                func_name,
+                                func_mod,
+                                submit_exc,
+                            )
+                        except Exception:
+                            logger.warning("提交子进程任务失败: %s", submit_exc)
+                        raise
                     try:
                         # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
                         processed_ok = future.result(timeout=300)
