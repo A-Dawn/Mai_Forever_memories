@@ -90,6 +90,7 @@
 - `/memories approve`: 在收到性能预警后，由管理员发送此命令以恢复自动任务。
 - `/memories run_daily`: 立即为当前聊天运行每日摘要任务。
 - `/memories run_weekly`: 立即为当前聊天运行每周摘要任务。
+- `/memories now`: 立即为当前聊天生成永久的记忆。
 
 ## 注意事项
 

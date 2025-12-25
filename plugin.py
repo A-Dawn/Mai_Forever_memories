@@ -44,8 +44,8 @@ logger = get_logger("mai_forever_memories")
 _plugin_instance = None
 
 
-def _process_rebuild_and_build_kg(raw_paragraphs: dict, triple_list_data: dict) -> bool:
-    """在子进程中执行的重建和 KG 构建任务（避免把大内存/CPU 操作留在主进程线程）。"""
+def _rebuild_and_build_in_subprocess(raw_paragraphs: dict, triple_list_data: dict) -> bool:
+    """在子进程中执行的重建和 KG 构建任务。"""
     try:
         from src.chat.knowledge.embedding_store import EmbeddingManager
         from src.chat.knowledge.kg_manager import KGManager
@@ -76,10 +76,15 @@ def _process_rebuild_and_build_kg(raw_paragraphs: dict, triple_list_data: dict) 
     except Exception as exc:
         # 子进程中发生异常，通过日志收集（主进程会捕获future.exception()）
         import traceback
-
         print("子进程执行重建/构建失败:", exc)
         traceback.print_exc()
         return False
+
+
+try:
+    _process_rebuild_and_build_kg.__module__ = __name__
+except Exception:
+    pass
 
 DAY_SECONDS = 24 * 60 * 60
 WEEK_SECONDS = 7 * DAY_SECONDS
@@ -341,7 +346,37 @@ class MemoriesCommand(BaseCommand):
             await self.send_text("已为此聊天安排每周摘要任务。", storage_message=False)
             return True, None, False
 
-        await self.send_text("用法: /memories [status|list|show|delete|daily|weekly]", storage_message=False)
+        if action == "now":
+            if not self.message.chat_stream:
+                await self.send_text("缺少聊天流。", storage_message=False)
+                return False, None, False
+
+            # 构造一个轻量的触发消息对象，供 run_forever 使用
+            class _FakeCommandMessage:
+                def __init__(self, chat_stream, command_self):
+                    self.chat_stream = chat_stream
+                    self._command_self = command_self
+
+                async def answer(self, text: str):
+                    # 使用命令实例提供的发送接口尝试回复（容错）
+                    try:
+                        await self._command_self.send_text(text, storage_message=False)
+                    except Exception:
+                        # 忽略发送错误
+                        pass
+
+            fm = _FakeCommandMessage(self.message.chat_stream, self)
+            chat_id = fm.chat_stream.stream_id if fm.chat_stream and hasattr(fm.chat_stream, "stream_id") else "unknown"
+            task_name = f"forever_memory_now_{chat_id}"
+            _plugin_instance._create_tracked_task(
+                _plugin_instance.run_forever(fm),
+                task_name=task_name
+            )
+            logger.info("已创建立即永久记忆任务: %s", task_name)
+            await self.send_text("已为此聊天立即生成永久的记忆。", storage_message=False)
+            return True, None, False
+
+        await self.send_text("用法: /memories [status|list|show|delete|daily|weekly|now]", storage_message=False)
         return True, None, False
 
 
@@ -1427,18 +1462,92 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 任务完成后子进程退出可将内存返还给操作系统。
         processed_ok = False
         try:
+            self._log_memory_state("before_subprocess_attempt", note=f"pg_hash={pg_hash}")
+        except Exception:
+            pass
+        try:
             from concurrent.futures import ProcessPoolExecutor as _LocalPPE
             # 为保证子进程在任务完成后退出，这里按任务创建进程池（上下文管理）
             try:
-                with _LocalPPE(max_workers=1) as pool:
-                    future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                # 在提交前记录函数和模块信息，便于诊断 Pickling/导入问题
+                logger.debug(
+                    "准备提交子进程任务: func=%s module=%s",
+                    getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>"),
+                    getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>"),
+                )
+                try:
+                    with _LocalPPE(max_workers=1) as pool:
+                        try:
+                            future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                        except Exception as submit_exc:
+                            # 捕获提交阶段的序列化/导入相关错误并记录详细信息
+                            try:
+                                func_mod = getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>")
+                                func_name = getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>")
+                                logger.warning(
+                                    "提交子进程任务失败（序列化或导入问题），func=%s module=%s error=%s",
+                                    func_name,
+                                    func_mod,
+                                    submit_exc,
+                                )
+                            except Exception:
+                                logger.warning("提交子进程任务失败: %s", submit_exc)
+                            raise
+                        try:
+                            # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
+                            processed_ok = future.result(timeout=300)
+                        except ProcessTimeoutError:
+                            logger.warning("子进程重建/构建超时，转回线程内执行")
+                            try:
+                                self._log_memory_state("subprocess_timeout", note=f"pg_hash={pg_hash}")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.warning("子进程重建/构建失败: %s", e)
+                            try:
+                                self._log_memory_state("subprocess_exception", note=f"pg_hash={pg_hash}, err={e}")
+                            except Exception:
+                                pass
+                except Exception as exc:
                     try:
-                        # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
-                        processed_ok = future.result(timeout=300)
-                    except ProcessTimeoutError:
-                        logger.warning("子进程重建/构建超时，转回线程内执行")
-                    except Exception as e:
-                        logger.warning("子进程重建/构建失败: %s", e)
+                        logger.warning("进程池提交失败 (%s)，改为以子进程脚本执行任务", exc)
+                        # 写临时 JSON 输入文件
+                        import tempfile, json
+
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as rawf:
+                            rawf.write(json.dumps(raw_paragraphs, ensure_ascii=False))
+                            raw_path_tmp = rawf.name
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as triplef:
+                            triplef.write(json.dumps(triple_list_data, ensure_ascii=False))
+                            triple_path_tmp = triplef.name
+
+                        worker_script = Path(self.plugin_dir) / "subprocess_worker.py"
+                        import subprocess
+
+                        try:
+                            proc = subprocess.run(
+                                [sys.executable or "python", str(worker_script), str(raw_path_tmp), str(triple_path_tmp)],
+                                cwd=str(self._root_dir),
+                                capture_output=True,
+                                text=True,
+                            )
+                            if proc.returncode != 0:
+                                logger.warning(
+                                    "子进程脚本返回非零代码 %s; stdout=%s stderr=%s",
+                                    proc.returncode,
+                                    (proc.stdout or "")[:2000],
+                                    (proc.stderr or "")[:2000],
+                                )
+                                processed_ok = False
+                            else:
+                                logger.info("子进程脚本执行成功，stdout=%s", (proc.stdout or "")[:1000])
+                                processed_ok = True
+                        except Exception as run_exc:
+                            logger.warning("以脚本回退执行子进程任务时 subprocess.run 失败: %s", run_exc, exc_info=True)
+                            processed_ok = False
+                    except Exception as inner_exc:
+                        logger.warning("以脚本回退执行子进程任务失败: %s", inner_exc, exc_info=True)
+                        processed_ok = False
             except Exception as exc:
                 logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
         except Exception:
