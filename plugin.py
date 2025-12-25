@@ -462,6 +462,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         self._raw_dir = self._data_dir / "raw"
         self._openie_dir = self._data_dir / "openie"
         self._delete_dir = self._data_dir / "delete"
+        self._logs_dir = self._data_dir / "logs"
         self._state_path = self._data_dir / "state.json"
         _plugin_instance = self
 
@@ -680,8 +681,56 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         return True
 
     def _ensure_dirs(self) -> None:
-        for path in [self._data_dir, self._raw_dir, self._openie_dir, self._delete_dir]:
+        for path in [self._data_dir, self._raw_dir, self._openie_dir, self._delete_dir, self._logs_dir]:
             path.mkdir(parents=True, exist_ok=True)
+
+    def _log_memory_state(self, label: str, note: str | None = None) -> None:
+        """记录当前进程内存状态与简单诊断信息，便于线下分析。"""
+        try:
+            if psutil:
+                try:
+                    proc = psutil.Process()
+                    rss = getattr(proc.memory_info(), "rss", None)
+                    vmem = psutil.virtual_memory()
+                    logger.info(
+                        "[MEM] %s: rss=%s bytes, vmem_percent=%.2f%%, tasks=%d, note=%s",
+                        label,
+                        rss,
+                        float(vmem.percent) if vmem is not None else 0.0,
+                        len(self._background_tasks) if hasattr(self, "_background_tasks") else -1,
+                        note or "",
+                    )
+                except Exception:
+                    logger.info("[MEM] %s: psutil Process query failed, note=%s", label, note or "")
+            else:
+                logger.info("[MEM] %s: psutil not installed, note=%s", label, note or "")
+        except Exception:
+            logger.debug("记录内存状态时发生异常", exc_info=True)
+        # 另外将相同信息追加写入插件本地 logs 目录的文件，便于后续离线分析
+        try:
+            try:
+                ts = datetime.now().isoformat()
+            except Exception:
+                ts = str(time.time())
+            try:
+                tasks_cnt = len(self._background_tasks) if hasattr(self, "_background_tasks") else -1
+                rss_val = rss if 'rss' in locals() else None
+                vmem_pct = float(vmem.percent) if ('vmem' in locals() and vmem is not None) else None
+                note_str = note or ""
+                line = f"{ts} | {label} | rss={rss_val} | vmem_percent={vmem_pct} | tasks={tasks_cnt} | note={note_str}\n"
+                try:
+                    log_path = getattr(self, "_logs_dir", None)
+                    if log_path:
+                        file_path = log_path / "memory.log"
+                        with open(file_path, "a", encoding="utf-8") as f:
+                            f.write(line)
+                except Exception:
+                    # 忽略文件写入错误
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _is_enabled(self) -> bool:
         return bool(self.get_config("plugin.enabled", False))
@@ -1285,16 +1334,28 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         注意：无法保证释放底层 C 扩展分配的内存；对共享模块请谨慎执行卸载。
         """
         try:
+            # 记录内存状态（尝试卸载前）
+            try:
+                self._log_memory_state("release_heavy_modules_start", note=str(module_prefixes))
+            except Exception:
+                pass
             import sys
             import gc
             # 删除 sys.modules 中以这些前缀开头的模块
             to_delete = [name for name in list(sys.modules.keys()) if any(name.startswith(p) for p in module_prefixes)]
+            deleted = 0
             for name in to_delete:
                 try:
                     del sys.modules[name]
+                    deleted += 1
                 except Exception:
                     pass
             gc.collect()
+            # 记录内存状态（尝试卸载后）
+            try:
+                self._log_memory_state("release_heavy_modules_end", note=f"deleted={deleted}, attempted={len(to_delete)}")
+            except Exception:
+                pass
         except Exception:
             # 不应抛出异常到业务流程
             logger.debug("卸载重型模块时发生异常", exc_info=True)
@@ -1392,9 +1453,18 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             # 继续执行，可能是首次运行
 
         paragraph_key = f"paragraph-{pg_hash}"
+        # 诊断记录：在检查重复之前记录内存状态
+        try:
+            self._log_memory_state("before_duplicate_check", note=f"pg_hash={pg_hash}")
+        except Exception:
+            pass
         if (paragraph_key in embed_manager.stored_pg_hashes and
             pg_hash in kg_manager.stored_paragraph_hashes):
             logger.info("段落已存在于知识库中，跳过导入。")
+            try:
+                self._log_memory_state("skip_import_already_exists", note=f"pg_hash={pg_hash}")
+            except Exception:
+                pass
             # 尝试清理临时持有的引用并卸载模块
             try:
                 if hasattr(embed_manager, "close"):
@@ -1427,6 +1497,10 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 任务完成后子进程退出可将内存返还给操作系统。
         processed_ok = False
         try:
+            self._log_memory_state("before_subprocess_attempt", note=f"pg_hash={pg_hash}")
+        except Exception:
+            pass
+        try:
             from concurrent.futures import ProcessPoolExecutor as _LocalPPE
             # 为保证子进程在任务完成后退出，这里按任务创建进程池（上下文管理）
             try:
@@ -1437,10 +1511,22 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                         processed_ok = future.result(timeout=300)
                     except ProcessTimeoutError:
                         logger.warning("子进程重建/构建超时，转回线程内执行")
+                        try:
+                            self._log_memory_state("subprocess_timeout", note=f"pg_hash={pg_hash}")
+                        except Exception:
+                            pass
                     except Exception as e:
                         logger.warning("子进程重建/构建失败: %s", e)
+                        try:
+                            self._log_memory_state("subprocess_exception", note=f"pg_hash={pg_hash}, err={e}")
+                        except Exception:
+                            pass
             except Exception as exc:
                 logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
+                try:
+                    self._log_memory_state("subprocess_submit_failed", note=str(exc))
+                except Exception:
+                    pass
         except Exception:
             # 如果不能导入或使用进程池，则回退到线程内执行
             processed_ok = False
@@ -1448,6 +1534,10 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 如果子进程执行失败或不可用，则回退到线程内执行（兼容性保障）
         if not processed_ok:
             try:
+                try:
+                    self._log_memory_state("fallback_to_thread", note=f"pg_hash={pg_hash}")
+                except Exception:
+                    pass
                 embed_manager = EmbeddingManager()
                 try:
                     embed_manager.load_from_file()
@@ -1467,8 +1557,16 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                 kg_manager.save_to_file()
             except Exception as exc:
                 logger.error("回退到线程执行索引/KG 构建失败: %s", exc, exc_info=True)
+                try:
+                    self._log_memory_state("fallback_thread_exception", note=str(exc))
+                except Exception:
+                    pass
                 return False
-
+        # 回退或子进程处理完成后记录内存状态，便于对比
+        try:
+            self._log_memory_state("after_import_processing", note=f"pg_hash={pg_hash}, processed_ok={processed_ok}")
+        except Exception:
+            pass
         # 使节点计数缓存失效，下次获取时会重新计算
         try:
             self._invalidate_node_count_cache()
