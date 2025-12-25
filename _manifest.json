@@ -1,11 +1,11 @@
 {
   "manifest_version": 1,
   "name": "Mai Forever Memories",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "将你与麦麦日常生活中的一点一滴保存为永恒的记忆，记录到LPMM中",
   "author": {
     "name": "ARC",
-    "url": "https://github.com/ARC" 
+    "url": "https://github.com/A-Dawn" 
   },
   "license": "AGPL-v3.0-or-later",
   "host_application": {

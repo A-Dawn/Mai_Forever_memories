@@ -19,13 +19,8 @@ except Exception:  # pragma: no cover
     ZoneInfo = None
 
 from src.config.config import global_config, model_config
-from src.chat.knowledge import lpmm_start_up
-from src.chat.knowledge.kg_manager import KGManager
-from src.chat.knowledge.embedding_store import EmbeddingManager
-from src.chat.knowledge.ie_process import info_extract_from_str
-from src.chat.knowledge.open_ie import OpenIE
-from src.chat.knowledge.utils.hash import get_sha256
-from src.llm_models.utils_model import LLMRequest
+# 为避免在主程序启动时立即导入并占用大量内存，
+# 将可能引入大型数据/本地扩展的模块改为按需在函数内部导入。
 from src.plugin_system import (
     BaseCommand,
     BaseEventHandler,
@@ -453,11 +448,10 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         self._tasks_lock = asyncio.Lock()
         # 限制并发的重型后台任务（如导入、索引重建）
         self._heavy_semaphore = asyncio.Semaphore(2)
-        # 进程池，用于隔离 CPU/内存密集型的索引/图构建任务
-        try:
-            self._process_pool = ProcessPoolExecutor(max_workers=1)
-        except Exception:
-            self._process_pool = None
+        # 延迟创建进程池以避免在插件加载时立即启动子进程
+        self._process_pool = None
+        # 跟踪本插件按需导入的“重型”模块前缀，便于在任务完成后尝试卸载
+        self._loaded_heavy_module_prefixes: set[str] = set()
         # KG 节点计数缓存（避免重复加载）
         self._cached_node_count: int | None = None
         self._node_count_cache_time: float = 0.0
@@ -1179,6 +1173,13 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         tz,
     ) -> dict | None:
         self._ensure_dirs()
+        # 按需导入 hash 函数，避免在模块导入时加载大型依赖
+        try:
+            from src.chat.knowledge.utils.hash import get_sha256
+        except Exception:
+            import hashlib
+            def get_sha256(text: str) -> str:
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()
         created_at = _now_ts()
         safe_id = _sanitize_filename(chat_id)
         stamp = int(created_at)
@@ -1279,8 +1280,52 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                 except Exception:
                     pass
 
+    def _release_heavy_modules(self, module_prefixes: list[str]) -> None:
+        """尝试卸载按需导入的模块并触发 GC，以便释放 Python 层引用和部分可回收的内存。
+        注意：无法保证释放底层 C 扩展分配的内存；对共享模块请谨慎执行卸载。
+        """
+        try:
+            import sys
+            import gc
+            # 删除 sys.modules 中以这些前缀开头的模块
+            to_delete = [name for name in list(sys.modules.keys()) if any(name.startswith(p) for p in module_prefixes)]
+            for name in to_delete:
+                try:
+                    del sys.modules[name]
+                except Exception:
+                    pass
+            gc.collect()
+        except Exception:
+            # 不应抛出异常到业务流程
+            logger.debug("卸载重型模块时发生异常", exc_info=True)
+
     def _import_raw_summary_blocking(self, raw_path: Path, openie_path: Path) -> bool:
         """同步、阻塞式的导入实现，供后台线程执行。"""
+        # 按需导入可能占用大量内存的模块（LLM、Embedding、KG、IE）
+        module_prefixes = [
+            "src.llm_models.utils_model",
+            "src.chat.knowledge.ie_process",
+            "src.chat.knowledge.open_ie",
+            "src.chat.knowledge.embedding_store",
+            "src.chat.knowledge.kg_manager",
+            "src.chat.knowledge.utils.hash",
+        ]
+        try:
+            from src.llm_models.utils_model import LLMRequest
+            from src.chat.knowledge.ie_process import info_extract_from_str
+            from src.chat.knowledge.open_ie import OpenIE
+            from src.chat.knowledge.embedding_store import EmbeddingManager
+            from src.chat.knowledge.kg_manager import KGManager
+            from src.chat.knowledge.utils.hash import get_sha256
+            # 记录已按需导入的模块前缀，任务完成后可尝试卸载
+            try:
+                self._loaded_heavy_module_prefixes.update(module_prefixes)
+            except Exception:
+                # 忽略在非实例上下文或其他意外情况
+                pass
+        except Exception as exc:
+            logger.error("导入 LPMM 相关模块失败: %s", exc, exc_info=True)
+            return False
         # 1. 读取原始文本
         try:
             text = raw_path.read_text(encoding="utf-8").strip()
@@ -1350,35 +1395,79 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         if (paragraph_key in embed_manager.stored_pg_hashes and
             pg_hash in kg_manager.stored_paragraph_hashes):
             logger.info("段落已存在于知识库中，跳过导入。")
+            # 尝试清理临时持有的引用并卸载模块
+            try:
+                if hasattr(embed_manager, "close"):
+                    try:
+                        embed_manager.close()
+                    except Exception:
+                        pass
+                if hasattr(kg_manager, "close"):
+                    try:
+                        kg_manager.close()
+                    except Exception:
+                        pass
+                # 删除本地引用以便 GC 回收
+                del embed_manager
+                del kg_manager
+                del openie_obj
+                # 尝试卸载相关模块
+                try:
+                    self._release_heavy_modules(module_prefixes)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             return True
 
         raw_paragraphs = {pg_hash: text}
         triple_list_data = {pg_hash: triples}
 
-        # 尝试在进程池中执行索引重建与 KG 构建，以隔离内存和 CPU 密集型工作
+        # 尝试在独立子进程中执行索引重建与 KG 构建，以确保重型内存分配在子进程中完成，
+        # 任务完成后子进程退出可将内存返还给操作系统。
         processed_ok = False
         try:
-            if getattr(self, "_process_pool", None):
-                future = self._process_pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
-                try:
-                    # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
-                    processed_ok = future.result(timeout=300)
-                except ProcessTimeoutError:
-                    logger.warning("子进程重建/构建超时，转回线程内执行")
-                except Exception as e:
-                    logger.warning("子进程重建/构建失败: %s", e)
-
-        except Exception as exc:
-            logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
+            from concurrent.futures import ProcessPoolExecutor as _LocalPPE
+            # 为保证子进程在任务完成后退出，这里按任务创建进程池（上下文管理）
+            try:
+                with _LocalPPE(max_workers=1) as pool:
+                    future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                    try:
+                        # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
+                        processed_ok = future.result(timeout=300)
+                    except ProcessTimeoutError:
+                        logger.warning("子进程重建/构建超时，转回线程内执行")
+                    except Exception as e:
+                        logger.warning("子进程重建/构建失败: %s", e)
+            except Exception as exc:
+                logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
+        except Exception:
+            # 如果不能导入或使用进程池，则回退到线程内执行
+            processed_ok = False
 
         # 如果子进程执行失败或不可用，则回退到线程内执行（兼容性保障）
         if not processed_ok:
-            embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
-            embed_manager.rebuild_faiss_index()
-            embed_manager.save_to_file()
+            try:
+                embed_manager = EmbeddingManager()
+                try:
+                    embed_manager.load_from_file()
+                except Exception as exc:
+                    logger.warning("加载 EmbeddingManager 失败: %s", exc, exc_info=True)
+                kg_manager = KGManager()
+                try:
+                    kg_manager.load_from_file()
+                except Exception as exc:
+                    logger.warning("加载 KGManager 失败: %s", exc, exc_info=True)
 
-            kg_manager.build_kg(triple_list_data, embed_manager)
-            kg_manager.save_to_file()
+                embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
+                embed_manager.rebuild_faiss_index()
+                embed_manager.save_to_file()
+
+                kg_manager.build_kg(triple_list_data, embed_manager)
+                kg_manager.save_to_file()
+            except Exception as exc:
+                logger.error("回退到线程执行索引/KG 构建失败: %s", exc, exc_info=True)
+                return False
 
         # 使节点计数缓存失效，下次获取时会重新计算
         try:
@@ -1388,6 +1477,33 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             logger.debug("后台线程调用 _invalidate_node_count_cache 失败", exc_info=True)
 
         logger.info("成功将摘要导入 LPMM 知识库。")
+        # 尝试清理持有的大对象并卸载按需导入的模块
+        try:
+            if 'embed_manager' in locals():
+                try:
+                    if hasattr(embed_manager, "close"):
+                        embed_manager.close()
+                except Exception:
+                    pass
+            if 'kg_manager' in locals():
+                try:
+                    if hasattr(kg_manager, "close"):
+                        kg_manager.close()
+                except Exception:
+                    pass
+            # 删除本地引用
+            for name in ("embed_manager", "kg_manager", "openie_obj", "entities", "triples", "doc_item"):
+                if name in locals():
+                    try:
+                        del locals()[name]
+                    except Exception:
+                        pass
+            try:
+                self._release_heavy_modules(module_prefixes)
+            except Exception:
+                pass
+        except Exception:
+            pass
         return True
 
     async def _run_due(self) -> None:
@@ -1480,7 +1596,12 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     state = await self._load_state()
                     state["entries"].append(entry)
                     await self._save_state(state)
-                    lpmm_start_up()
+                    try:
+                        from src.chat.knowledge import lpmm_start_up
+                    except Exception:
+                        lpmm_start_up = None
+                    if lpmm_start_up:
+                        lpmm_start_up()
                     logger.info("已成功登记永远的记忆: %s, chat_id: %s", entry["id"], chat_id)
                     # 可以选择发送一个确认消息
                     try:
@@ -1607,7 +1728,12 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             refresh_needed = refresh_needed or capacity_refresh
 
             if refresh_needed:
-                lpmm_start_up()
+                try:
+                    from src.chat.knowledge import lpmm_start_up
+                except Exception:
+                    lpmm_start_up = None
+                if lpmm_start_up:
+                    lpmm_start_up()
             if changed or capacity_changed:
                 await self._save_state(state)
             
@@ -1714,7 +1840,12 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             refresh_needed = refresh_needed or capacity_refresh
 
             if refresh_needed:
-                lpmm_start_up()
+                try:
+                    from src.chat.knowledge import lpmm_start_up
+                except Exception:
+                    lpmm_start_up = None
+                if lpmm_start_up:
+                    lpmm_start_up()
             if changed or capacity_changed:
                 await self._save_state(state)
             
@@ -1738,6 +1869,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 刷新缓存（在后台线程中执行阻塞操作）
         try:
             def _load_count():
+                from src.chat.knowledge.kg_manager import KGManager
                 kg_manager = KGManager()
                 kg_manager.load_from_file()
                 return len(kg_manager.graph.get_node_list())
