@@ -699,17 +699,13 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     rss = getattr(proc.memory_info(), "rss", None)
                     vmem = psutil.virtual_memory()
                     logger.info(
-                        "[MEM] %s: rss=%s bytes, vmem_percent=%.2f%%, tasks=%d, note=%s",
-                        label,
-                        rss,
-                        float(vmem.percent) if vmem is not None else 0.0,
-                        len(self._background_tasks) if hasattr(self, "_background_tasks") else -1,
-                        note or "",
+                        f"[MEM] {label}: rss={rss} bytes, vmem_percent={float(vmem.percent) if vmem is not None else 0.0:.2f}%, "
+                        f"tasks={len(self._background_tasks) if hasattr(self, '_background_tasks') else -1}, note={note or ''}"
                     )
                 except Exception:
-                    logger.info("[MEM] %s: psutil Process query failed, note=%s", label, note or "")
+                    logger.info(f"[MEM] {label}: psutil Process query failed, note={note or ''}")
             else:
-                logger.info("[MEM] %s: psutil not installed, note=%s", label, note or "")
+                logger.info(f"[MEM] {label}: psutil not installed, note={note or ''}")
         except Exception:
             logger.debug("记录内存状态时发生异常", exc_info=True)
         # 另外将相同信息追加写入插件本地 logs 目录的文件，便于后续离线分析
@@ -1516,38 +1512,79 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>"),
                     getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>"),
                 )
-                with _LocalPPE(max_workers=1) as pool:
-                    try:
-                        future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
-                    except Exception as submit_exc:
-                        # 捕获提交阶段的序列化/导入相关错误并记录详细信息
+                try:
+                    with _LocalPPE(max_workers=1) as pool:
                         try:
-                            func_mod = getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>")
-                            func_name = getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>")
-                            logger.warning(
-                                "提交子进程任务失败（序列化或导入问题），func=%s module=%s error=%s",
-                                func_name,
-                                func_mod,
-                                submit_exc,
+                            future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
+                        except Exception as submit_exc:
+                            # 捕获提交阶段的序列化/导入相关错误并记录详细信息
+                            try:
+                                func_mod = getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>")
+                                func_name = getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>")
+                                logger.warning(
+                                    "提交子进程任务失败（序列化或导入问题），func=%s module=%s error=%s",
+                                    func_name,
+                                    func_mod,
+                                    submit_exc,
+                                )
+                            except Exception:
+                                logger.warning("提交子进程任务失败: %s", submit_exc)
+                            raise
+                        try:
+                            # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
+                            processed_ok = future.result(timeout=300)
+                        except ProcessTimeoutError:
+                            logger.warning("子进程重建/构建超时，转回线程内执行")
+                            try:
+                                self._log_memory_state("subprocess_timeout", note=f"pg_hash={pg_hash}")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.warning("子进程重建/构建失败: %s", e)
+                            try:
+                                self._log_memory_state("subprocess_exception", note=f"pg_hash={pg_hash}, err={e}")
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    try:
+                        logger.warning("进程池提交失败 (%s)，改为以子进程脚本执行任务", exc)
+                        # 写临时 JSON 输入文件
+                        import tempfile, json
+
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as rawf:
+                            rawf.write(json.dumps(raw_paragraphs, ensure_ascii=False))
+                            raw_path_tmp = rawf.name
+                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as triplef:
+                            triplef.write(json.dumps(triple_list_data, ensure_ascii=False))
+                            triple_path_tmp = triplef.name
+
+                        worker_script = Path(self.plugin_dir) / "subprocess_worker.py"
+                        import subprocess
+
+                        try:
+                            proc = subprocess.run(
+                                [sys.executable or "python", str(worker_script), str(raw_path_tmp), str(triple_path_tmp)],
+                                cwd=str(self._root_dir),
+                                capture_output=True,
+                                text=True,
                             )
-                        except Exception:
-                            logger.warning("提交子进程任务失败: %s", submit_exc)
-                        raise
-                    try:
-                        # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
-                        processed_ok = future.result(timeout=300)
-                    except ProcessTimeoutError:
-                        logger.warning("子进程重建/构建超时，转回线程内执行")
-                        try:
-                            self._log_memory_state("subprocess_timeout", note=f"pg_hash={pg_hash}")
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        logger.warning("子进程重建/构建失败: %s", e)
-                        try:
-                            self._log_memory_state("subprocess_exception", note=f"pg_hash={pg_hash}, err={e}")
-                        except Exception:
-                            pass
+                            if proc.returncode != 0:
+                                logger.warning(
+                                    "子进程脚本返回非零代码 %s; stdout=%s stderr=%s",
+                                    proc.returncode,
+                                    (proc.stdout or "")[:2000],
+                                    (proc.stderr or "")[:2000],
+                                )
+                                processed_ok = False
+                            else:
+                                logger.info("子进程脚本执行成功，stdout=%s", (proc.stdout or "")[:1000])
+                                processed_ok = True
+                        except Exception as run_exc:
+                            logger.warning("以脚本回退执行子进程任务时 subprocess.run 失败: %s", run_exc, exc_info=True)
+                            processed_ok = False
+                    except Exception as inner_exc:
+                        logger.warning("以脚本回退执行子进程任务失败: %s", inner_exc, exc_info=True)
+                        processed_ok = False
             except Exception as exc:
                 logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
                 try:
