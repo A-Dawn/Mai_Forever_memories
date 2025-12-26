@@ -44,47 +44,17 @@ logger = get_logger("mai_forever_memories")
 _plugin_instance = None
 
 
-def _rebuild_and_build_in_subprocess(raw_paragraphs: dict, triple_list_data: dict) -> bool:
-    """在子进程中执行的重建和 KG 构建任务。"""
-    try:
-        from src.chat.knowledge.embedding_store import EmbeddingManager
-        from src.chat.knowledge.kg_manager import KGManager
-
-        embed_manager = EmbeddingManager()
-        try:
-            embed_manager.load_from_file()
-        except Exception:
-            # 允许首次导入时不存在文件
-            pass
-
-        kg_manager = KGManager()
-        try:
-            kg_manager.load_from_file()
-        except Exception:
-            pass
-
-        # 存储并重建索引
-        embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
-        embed_manager.rebuild_faiss_index()
-        embed_manager.save_to_file()
-
-        # 构建 KG 并保存
-        kg_manager.build_kg(triple_list_data, embed_manager)
-        kg_manager.save_to_file()
-
-        return True
-    except Exception as exc:
-        # 子进程中发生异常，通过日志收集（主进程会捕获future.exception()）
-        import traceback
-        print("子进程执行重建/构建失败:", exc)
-        traceback.print_exc()
-        return False
-
-
+# 在模块级别预导入这些类，避免 pickle 序列化问题
 try:
-    _process_rebuild_and_build_kg.__module__ = __name__
-except Exception:
-    pass
+    from src.chat.knowledge.embedding_store import EmbeddingManager
+    from src.chat.knowledge.kg_manager import KGManager
+    _EMBEDDING_MANAGER_AVAILABLE = True
+except ImportError:
+    EmbeddingManager = None
+    KGManager = None
+    _EMBEDDING_MANAGER_AVAILABLE = False
+
+# 函数已移动到类内部作为静态方法，让 Python 自动处理
 
 DAY_SECONDS = 24 * 60 * 60
 WEEK_SECONDS = 7 * DAY_SECONDS
@@ -500,6 +470,60 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         self._state_path = self._data_dir / "state.json"
         _plugin_instance = self
 
+    @staticmethod
+    def _process_rebuild_and_build_kg(raw_paragraphs: dict, triple_list_data: dict) -> bool:
+        """在子进程中执行的重建和 KG 构建任务。"""
+        if not _EMBEDDING_MANAGER_AVAILABLE:
+            print("子进程错误: 无法导入所需的知识库管理器")
+            return False
+
+        try:
+            embed_manager = EmbeddingManager()
+            try:
+                embed_manager.load_from_file()
+            except Exception:
+                # 允许首次导入时不存在文件
+                pass
+
+            kg_manager = KGManager()
+            try:
+                kg_manager.load_from_file()
+            except Exception:
+                pass
+
+            # 存储并重建索引
+            embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
+            embed_manager.rebuild_faiss_index()
+            embed_manager.save_to_file()
+
+            # 构建 KG 并保存
+            kg_manager.build_kg(triple_list_data, embed_manager)
+            kg_manager.save_to_file()
+
+            # 清理内存
+            try:
+                if hasattr(embed_manager, 'close'):
+                    embed_manager.close()
+                if hasattr(kg_manager, 'close'):
+                    kg_manager.close()
+                # 清理嵌入库数据
+                if hasattr(embed_manager, 'stored_pg_hashes'):
+                    embed_manager.stored_pg_hashes.clear()
+                if hasattr(embed_manager, 'faiss_index'):
+                    embed_manager.faiss_index = None
+                if hasattr(kg_manager, 'graph') and hasattr(kg_manager.graph, 'clear'):
+                    kg_manager.graph.clear()
+            except Exception as cleanup_exc:
+                print(f"清理过程中出错: {cleanup_exc}")
+
+            return True
+        except Exception as exc:
+            # 子进程中发生异常，通过日志收集（主进程会捕获future.exception()）
+            import traceback
+            print("子进程执行重建/构建失败:", exc)
+            traceback.print_exc()
+            return False
+
     def get_plugin_components(self) -> list[tuple[ComponentInfo, type]]:
         components = [
             (MemoriesStartupHandler.get_handler_info(), MemoriesStartupHandler),
@@ -748,27 +772,97 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         self._scheduler_task = None
         
         # 取消所有后台任务
+        task_cleanup_stats = {
+            'total_tasks': 0,
+            'cancelled_tasks': 0,
+            'already_done': 0,
+            'cancel_failures': 0,
+            'gather_exceptions': []
+        }
+
         async with self._tasks_lock:
             active_tasks = list(self._background_tasks)
+            task_cleanup_stats['total_tasks'] = len(active_tasks)
+
             if active_tasks:
                 logger.info("正在取消 %d 个后台任务...", len(active_tasks))
+
+                # 1. 取消未完成的任务
                 for task in active_tasks:
-                    if not task.done():
-                        task.cancel()
-                # 等待所有任务完成或取消
+                    try:
+                        if task.done():
+                            task_cleanup_stats['already_done'] += 1
+                        else:
+                            task.cancel()
+                            task_cleanup_stats['cancelled_tasks'] += 1
+                    except Exception as e:
+                        task_cleanup_stats['cancel_failures'] += 1
+                        logger.warning("取消任务时出错: %s", e)
+
+                # 2. 等待所有任务完成或取消
                 if active_tasks:
-                    await asyncio.gather(*active_tasks, return_exceptions=True)
+                    try:
+                        results = await asyncio.gather(*active_tasks, return_exceptions=True)
+                        # 检查是否有异常结果
+                        for i, result in enumerate(results):
+                            if isinstance(result, Exception):
+                                task_cleanup_stats['gather_exceptions'].append((i, str(result)))
+                    except Exception as e:
+                        logger.error("等待任务完成时发生异常: %s", e)
+
+                # 3. 清空任务集合
                 self._background_tasks.clear()
-                logger.info("所有后台任务已清理")
+
+                # 4. 报告清理结果
+                logger.info("任务清理完成: 总数=%d, 已取消=%d, 已完成=%d, 取消失败=%d",
+                           task_cleanup_stats['total_tasks'],
+                           task_cleanup_stats['cancelled_tasks'],
+                           task_cleanup_stats['already_done'],
+                           task_cleanup_stats['cancel_failures'])
+
+                if task_cleanup_stats['gather_exceptions']:
+                    logger.warning("任务执行中出现 %d 个异常，第一个: %s",
+                                 len(task_cleanup_stats['gather_exceptions']),
+                                 task_cleanup_stats['gather_exceptions'][0][1])
+
+                if task_cleanup_stats['cancel_failures'] > 0:
+                    logger.warning("有 %d 个任务取消失败，可能存在资源泄漏",
+                                 task_cleanup_stats['cancel_failures'])
         # 关闭进程池（如果存在），避免子进程遗留
+        process_cleanup_result = {
+            'pool_found': False,
+            'shutdown_attempted': False,
+            'shutdown_success': False,
+            'shutdown_error': None
+        }
+
         try:
-            if getattr(self, "_process_pool", None):
+            process_pool = getattr(self, "_process_pool", None)
+            if process_pool is not None:
+                process_cleanup_result['pool_found'] = True
                 try:
-                    self._process_pool.shutdown(wait=False)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                    logger.debug("正在关闭进程池...")
+                    process_pool.shutdown(wait=False)
+                    process_cleanup_result['shutdown_success'] = True
+                    process_cleanup_result['shutdown_attempted'] = True
+                    logger.debug("进程池关闭成功")
+                except Exception as e:
+                    process_cleanup_result['shutdown_error'] = str(e)
+                    process_cleanup_result['shutdown_attempted'] = True
+                    logger.warning("进程池关闭失败: %s", e)
+            else:
+                logger.debug("没有找到活跃的进程池")
+        except Exception as e:
+            logger.error("检查进程池状态时发生异常: %s", e)
+            process_cleanup_result['shutdown_error'] = str(e)
+
+        # 清理进程池引用
+        try:
+            if hasattr(self, "_process_pool"):
+                self._process_pool = None
+                logger.debug("进程池引用已清理")
+        except Exception as e:
+            logger.warning("清理进程池引用时出错: %s", e)
         
         logger.info("记忆调度器已停止。")
 
@@ -1322,17 +1416,55 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         try:
             import sys
             import gc
-            # 删除 sys.modules 中以这些前缀开头的模块
+        except ImportError as e:
+            logger.warning("无法导入必要的模块用于清理: %s", e)
+            return
+
+        # 查找需要卸载的模块
+        try:
             to_delete = [name for name in list(sys.modules.keys()) if any(name.startswith(p) for p in module_prefixes)]
-            for name in to_delete:
-                try:
+            if not to_delete:
+                logger.debug("没有找到需要卸载的模块")
+                return
+        except Exception as e:
+            logger.warning("查找需要卸载的模块时出错: %s", e)
+            return
+
+        logger.debug("尝试卸载 %d 个重型模块: %s", len(to_delete), to_delete[:5])  # 只显示前5个避免日志过长
+
+        # 逐个卸载模块
+        unloaded_count = 0
+        failed_modules = []
+
+        for name in to_delete:
+            try:
+                # 检查模块是否仍然存在（可能在迭代过程中被其他地方卸载）
+                if name in sys.modules:
                     del sys.modules[name]
-                except Exception:
-                    pass
-            gc.collect()
-        except Exception:
-            # 不应抛出异常到业务流程
-            logger.debug("卸载重型模块时发生异常", exc_info=True)
+                    unloaded_count += 1
+                else:
+                    logger.debug("模块 %s 已被其他地方卸载", name)
+            except KeyError:
+                # 模块不存在，可能是并发卸载导致的
+                logger.debug("模块 %s 在卸载时不存在", name)
+            except Exception as e:
+                failed_modules.append((name, str(e)))
+                logger.debug("卸载模块 %s 失败: %s", name, e)
+
+        # 报告卸载结果
+        if unloaded_count > 0:
+            logger.debug("成功卸载 %d 个模块", unloaded_count)
+
+        if failed_modules:
+            logger.warning("卸载 %d 个模块失败: %s", len(failed_modules),
+                          [(name, error) for name, error in failed_modules[:3]])  # 只显示前3个错误
+
+        # 触发垃圾回收
+        try:
+            collected = gc.collect()
+            logger.debug("垃圾回收完成，回收了 %d 个对象", collected)
+        except Exception as e:
+            logger.warning("垃圾回收执行失败: %s", e)
 
     def _import_raw_summary_blocking(self, raw_path: Path, openie_path: Path) -> bool:
         """同步、阻塞式的导入实现，供后台线程执行。"""
@@ -1346,6 +1478,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             "src.chat.knowledge.utils.hash",
         ]
         try:
+            import json
             from src.llm_models.utils_model import LLMRequest
             from src.chat.knowledge.ie_process import info_extract_from_str
             from src.chat.knowledge.open_ie import OpenIE
@@ -1458,125 +1591,120 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         raw_paragraphs = {pg_hash: text}
         triple_list_data = {pg_hash: triples}
 
-        # 尝试在独立子进程中执行索引重建与 KG 构建，以确保重型内存分配在子进程中完成，
-        # 任务完成后子进程退出可将内存返还给操作系统。
+        # 在当前进程中执行索引重建与 KG 构建任务
+        # 通过手动内存管理和对象清理实现内存优化
         processed_ok = False
+        logger.debug("开始执行索引重建和KG构建任务 (优化内存管理模式)")
         try:
-            self._log_memory_state("before_subprocess_attempt", note=f"pg_hash={pg_hash}")
-        except Exception:
-            pass
-        try:
-            from concurrent.futures import ProcessPoolExecutor as _LocalPPE
-            # 为保证子进程在任务完成后退出，这里按任务创建进程池（上下文管理）
+            embed_manager = EmbeddingManager()
             try:
-                # 在提交前记录函数和模块信息，便于诊断 Pickling/导入问题
-                logger.debug(
-                    "准备提交子进程任务: func=%s module=%s",
-                    getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>"),
-                    getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>"),
-                )
+                embed_manager.load_from_file()
+            except Exception as exc:
+                logger.warning("加载 EmbeddingManager 失败: %s", exc, exc_info=True)
+            kg_manager = KGManager()
+            try:
+                kg_manager.load_from_file()
+            except Exception as exc:
+                logger.warning("加载 KGManager 失败: %s", exc, exc_info=True)
+
+            embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
+            embed_manager.rebuild_faiss_index()
+            embed_manager.save_to_file()
+
+            kg_manager.build_kg(triple_list_data, embed_manager)
+            kg_manager.save_to_file()
+            processed_ok = True
+
+            # 在任务执行后立即清理内存，避免大型数据结构驻留
+            logger.debug("任务执行完成，开始清理内存...")
+            try:
+                # 强制清理嵌入库数据
+                if hasattr(embed_manager, 'clear_memory'):
+                    embed_manager.clear_memory()
+                elif hasattr(embed_manager, 'unload_all'):
+                    embed_manager.unload_all()
+                # 清理可能存在的嵌入向量数据
+                if hasattr(embed_manager, 'stored_pg_hashes'):
+                    embed_manager.stored_pg_hashes.clear()
+                if hasattr(embed_manager, 'faiss_index'):
+                    # 尝试释放Faiss索引内存
+                    embed_manager.faiss_index = None
+
+                # 清理KG管理器数据
+                if hasattr(kg_manager, 'clear_memory'):
+                    kg_manager.clear_memory()
+                elif hasattr(kg_manager, 'unload_all'):
+                    kg_manager.unload_all()
+                # 清理图数据
+                if hasattr(kg_manager, 'graph'):
+                    if hasattr(kg_manager.graph, 'clear'):
+                        kg_manager.graph.clear()
+                    elif hasattr(kg_manager.graph, 'reset'):
+                        kg_manager.graph.reset()
+
+                # 强制垃圾回收
+                import gc
+                collected = gc.collect()
+                logger.debug("清理完成，回收了 %d 个对象", collected)
+
+            except Exception as cleanup_exc:
+                logger.warning("内存清理过程中出错: %s", cleanup_exc)
+
+        except Exception as exc:
+            logger.error("回退到线程执行索引/KG 构建失败: %s", exc, exc_info=True)
+            return False
+
+        # 额外的内存清理阶段
+        memory_cleanup_stats = {
+            'embed_manager_closed': False,
+            'kg_manager_closed': False,
+            'objects_deleted': 0,
+            'gc_cycles': 0
+        }
+
+        try:
+            # 确保管理器被正确关闭
+            if 'embed_manager' in locals() and embed_manager is not None:
                 try:
-                    with _LocalPPE(max_workers=1) as pool:
-                        try:
-                            future = pool.submit(_process_rebuild_and_build_kg, raw_paragraphs, triple_list_data)
-                        except Exception as submit_exc:
-                            # 捕获提交阶段的序列化/导入相关错误并记录详细信息
-                            try:
-                                func_mod = getattr(_process_rebuild_and_build_kg, "__module__", "<unknown>")
-                                func_name = getattr(_process_rebuild_and_build_kg, "__name__", "<unknown>")
-                                logger.warning(
-                                    "提交子进程任务失败（序列化或导入问题），func=%s module=%s error=%s",
-                                    func_name,
-                                    func_mod,
-                                    submit_exc,
-                                )
-                            except Exception:
-                                logger.warning("提交子进程任务失败: %s", submit_exc)
-                            raise
-                        try:
-                            # 使用可配置的超时（秒），这里默认300s，可根据需要调整或放入配置
-                            processed_ok = future.result(timeout=300)
-                        except ProcessTimeoutError:
-                            logger.warning("子进程重建/构建超时，转回线程内执行")
-                            try:
-                                self._log_memory_state("subprocess_timeout", note=f"pg_hash={pg_hash}")
-                            except Exception:
-                                pass
-                        except Exception as e:
-                            logger.warning("子进程重建/构建失败: %s", e)
-                            try:
-                                self._log_memory_state("subprocess_exception", note=f"pg_hash={pg_hash}, err={e}")
-                            except Exception:
-                                pass
-                except Exception as exc:
+                    if hasattr(embed_manager, "close"):
+                        embed_manager.close()
+                        memory_cleanup_stats['embed_manager_closed'] = True
+                except Exception as e:
+                    logger.debug("关闭embed_manager时出错: %s", e)
+
+            if 'kg_manager' in locals() and kg_manager is not None:
+                try:
+                    if hasattr(kg_manager, "close"):
+                        kg_manager.close()
+                        memory_cleanup_stats['kg_manager_closed'] = True
+                except Exception as e:
+                    logger.debug("关闭kg_manager时出错: %s", e)
+
+            # 强制删除引用并多次GC
+            objects_to_delete = ['embed_manager', 'kg_manager', 'raw_paragraphs', 'triple_list_data']
+            for obj_name in objects_to_delete:
+                if obj_name in locals():
                     try:
-                        logger.warning("进程池提交失败 (%s)，改为以子进程脚本执行任务", exc)
-                        # 写临时 JSON 输入文件
-                        import tempfile, json
+                        del locals()[obj_name]
+                        memory_cleanup_stats['objects_deleted'] += 1
+                    except Exception as e:
+                        logger.debug("删除对象 %s 时出错: %s", obj_name, e)
 
-                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as rawf:
-                            rawf.write(json.dumps(raw_paragraphs, ensure_ascii=False))
-                            raw_path_tmp = rawf.name
-                        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as triplef:
-                            triplef.write(json.dumps(triple_list_data, ensure_ascii=False))
-                            triple_path_tmp = triplef.name
+            # 多次垃圾回收以确保清理
+            import gc
+            for _ in range(3):
+                collected = gc.collect()
+                memory_cleanup_stats['gc_cycles'] += 1
+                if collected == 0:
+                    break
 
-                        worker_script = Path(self.plugin_dir) / "subprocess_worker.py"
-                        import subprocess
+            logger.debug("内存清理统计: 关闭管理器=%s, 删除对象=%d, GC循环=%d",
+                        f"embed:{memory_cleanup_stats['embed_manager_closed']}/kg:{memory_cleanup_stats['kg_manager_closed']}",
+                        memory_cleanup_stats['objects_deleted'],
+                        memory_cleanup_stats['gc_cycles'])
 
-                        try:
-                            proc = subprocess.run(
-                                [sys.executable or "python", str(worker_script), str(raw_path_tmp), str(triple_path_tmp)],
-                                cwd=str(self._root_dir),
-                                capture_output=True,
-                                text=True,
-                            )
-                            if proc.returncode != 0:
-                                logger.warning(
-                                    "子进程脚本返回非零代码 %s; stdout=%s stderr=%s",
-                                    proc.returncode,
-                                    (proc.stdout or "")[:2000],
-                                    (proc.stderr or "")[:2000],
-                                )
-                                processed_ok = False
-                            else:
-                                logger.info("子进程脚本执行成功，stdout=%s", (proc.stdout or "")[:1000])
-                                processed_ok = True
-                        except Exception as run_exc:
-                            logger.warning("以脚本回退执行子进程任务时 subprocess.run 失败: %s", run_exc, exc_info=True)
-                            processed_ok = False
-                    except Exception as inner_exc:
-                        logger.warning("以脚本回退执行子进程任务失败: %s", inner_exc, exc_info=True)
-                        processed_ok = False
-            except Exception as exc:
-                logger.warning("提交子进程任务失败，转回线程执行: %s", exc, exc_info=True)
-        except Exception:
-            # 如果不能导入或使用进程池，则回退到线程内执行
-            processed_ok = False
-
-        # 如果子进程执行失败或不可用，则回退到线程内执行（兼容性保障）
-        if not processed_ok:
-            try:
-                embed_manager = EmbeddingManager()
-                try:
-                    embed_manager.load_from_file()
-                except Exception as exc:
-                    logger.warning("加载 EmbeddingManager 失败: %s", exc, exc_info=True)
-                kg_manager = KGManager()
-                try:
-                    kg_manager.load_from_file()
-                except Exception as exc:
-                    logger.warning("加载 KGManager 失败: %s", exc, exc_info=True)
-
-                embed_manager.store_new_data_set(raw_paragraphs, triple_list_data)
-                embed_manager.rebuild_faiss_index()
-                embed_manager.save_to_file()
-
-                kg_manager.build_kg(triple_list_data, embed_manager)
-                kg_manager.save_to_file()
-            except Exception as exc:
-                logger.error("回退到线程执行索引/KG 构建失败: %s", exc, exc_info=True)
-                return False
+        except Exception as final_cleanup_exc:
+            logger.warning("最终内存清理阶段出错: %s", final_cleanup_exc)
 
         # 使节点计数缓存失效，下次获取时会重新计算
         try:
@@ -1587,32 +1715,75 @@ class MaiForeverMemoriesPlugin(BasePlugin):
 
         logger.info("成功将摘要导入 LPMM 知识库。")
         # 尝试清理持有的大对象并卸载按需导入的模块
+        cleanup_results = {
+            'closed_managers': [],
+            'failed_closes': [],
+            'deleted_refs': [],
+            'failed_deletes': [],
+            'module_unload_success': False
+        }
+
         try:
-            if 'embed_manager' in locals():
-                try:
-                    if hasattr(embed_manager, "close"):
-                        embed_manager.close()
-                except Exception:
-                    pass
-            if 'kg_manager' in locals():
-                try:
-                    if hasattr(kg_manager, "close"):
-                        kg_manager.close()
-                except Exception:
-                    pass
-            # 删除本地引用
-            for name in ("embed_manager", "kg_manager", "openie_obj", "entities", "triples", "doc_item"):
-                if name in locals():
+            # 1. 关闭资源管理器
+            managers_to_close = [
+                ('embed_manager', embed_manager if 'embed_manager' in locals() else None),
+                ('kg_manager', kg_manager if 'kg_manager' in locals() else None)
+            ]
+
+            for manager_name, manager in managers_to_close:
+                if manager is not None:
                     try:
-                        del locals()[name]
-                    except Exception:
+                        if hasattr(manager, "close"):
+                            manager.close()
+                            cleanup_results['closed_managers'].append(manager_name)
+                            logger.debug("成功关闭 %s", manager_name)
+                        else:
+                            logger.debug("%s 没有 close 方法", manager_name)
+                    except Exception as e:
+                        cleanup_results['failed_closes'].append((manager_name, str(e)))
+                        logger.warning("关闭 %s 时出错: %s", manager_name, e)
+
+            # 2. 删除本地引用
+            refs_to_delete = ["embed_manager", "kg_manager", "openie_obj", "entities", "triples", "doc_item"]
+
+            for ref_name in refs_to_delete:
+                if ref_name in locals():
+                    try:
+                        del locals()[ref_name]
+                        cleanup_results['deleted_refs'].append(ref_name)
+                    except NameError:
+                        # 变量不存在，可能已经被删除了
                         pass
+                    except Exception as e:
+                        cleanup_results['failed_deletes'].append((ref_name, str(e)))
+                        logger.debug("删除引用 %s 时出错: %s", ref_name, e)
+
+            # 3. 卸载重型模块
             try:
                 self._release_heavy_modules(module_prefixes)
-            except Exception:
-                pass
-        except Exception:
-            pass
+                cleanup_results['module_unload_success'] = True
+            except Exception as e:
+                logger.warning("模块卸载过程中出现异常: %s", e)
+
+        except Exception as e:
+            logger.error("对象清理过程中发生严重错误: %s", e, exc_info=True)
+        finally:
+            # 记录清理结果摘要
+            if cleanup_results['closed_managers']:
+                logger.debug("清理总结: 关闭了 %d 个管理器 (%s)",
+                           len(cleanup_results['closed_managers']),
+                           ', '.join(cleanup_results['closed_managers']))
+
+            if cleanup_results['failed_closes']:
+                logger.warning("清理总结: %d 个管理器关闭失败 (%s)",
+                             len(cleanup_results['failed_closes']),
+                             ', '.join(name for name, _ in cleanup_results['failed_closes']))
+
+            if cleanup_results['deleted_refs']:
+                logger.debug("清理总结: 删除了 %d 个对象引用", len(cleanup_results['deleted_refs']))
+
+            if cleanup_results['failed_deletes']:
+                logger.debug("清理总结: %d 个引用删除失败", len(cleanup_results['failed_deletes']))
         return True
 
     async def _run_due(self) -> None:
@@ -1631,6 +1802,63 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         if bool(self.get_config("schedule.enable_weekly", True)):
             weekly_anchor = self._weekly_anchor(now)
             await self.run_weekly(streams=streams, manual=False, anchor=weekly_anchor)
+
+    async def _force_global_memory_cleanup(self) -> None:
+        """强制进行全局内存清理，在刷新LPMM系统前调用"""
+        logger.debug("开始强制全局内存清理...")
+
+        try:
+            # 1. 强制多次垃圾回收
+            import gc
+            collected_total = 0
+            for i in range(5):  # 多轮GC
+                collected = gc.collect()
+                collected_total += collected
+                if collected == 0 and i > 1:  # 如果两轮都没有回收对象，提前退出
+                    break
+
+            logger.debug("强制GC回收了 %d 个对象", collected_total)
+
+            # 2. 尝试清理LPMM系统的内存
+            try:
+                # 清理可能的全局embedding管理器缓存
+                import sys
+                for module_name in list(sys.modules.keys()):
+                    if 'embedding' in module_name.lower() or 'kg' in module_name.lower():
+                        module = sys.modules.get(module_name)
+                        if module and hasattr(module, 'clear_cache'):
+                            try:
+                                module.clear_cache()
+                                logger.debug("清理了模块 %s 的缓存", module_name)
+                            except Exception as e:
+                                logger.debug("清理模块 %s 缓存失败: %s", module_name, e)
+            except Exception as e:
+                logger.debug("清理LPMM系统内存失败: %s", e)
+
+            # 3. 卸载重型模块
+            heavy_modules = [
+                "src.chat.knowledge.embedding_store",
+                "src.chat.knowledge.kg_manager",
+                "src.chat.knowledge.ie_process",
+                "src.chat.knowledge.open_ie",
+                "src.llm_models.utils_model"
+            ]
+            await asyncio.to_thread(self._release_heavy_modules, heavy_modules)
+
+            # 4. 最后的GC
+            final_collected = gc.collect()
+            logger.debug("最终GC回收了 %d 个对象", final_collected)
+
+            # 5. 强制清理弱引用
+            try:
+                import weakref
+                # 清理所有弱引用回调
+                weakref._remove_dead_weakrefs()
+            except Exception as e:
+                logger.debug("清理弱引用失败: %s", e)
+
+        except Exception as e:
+            logger.warning("强制全局内存清理过程中出错: %s", e)
 
     async def run_forever(self, trigger_message: MaiMessages) -> None:
         """手动触发的"永远的记忆"逻辑。"""
@@ -1705,6 +1933,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     state = await self._load_state()
                     state["entries"].append(entry)
                     await self._save_state(state)
+                    # 在刷新LPMM系统前先进行全局内存清理
+                    await self._force_global_memory_cleanup()
                     try:
                         from src.chat.knowledge import lpmm_start_up
                     except Exception:
@@ -1845,7 +2075,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     lpmm_start_up()
             if changed or capacity_changed:
                 await self._save_state(state)
-            
+
             # 运行结束后检查性能
             is_dangerous, desc = self._check_performance()
             if is_dangerous:
@@ -1949,6 +2179,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             refresh_needed = refresh_needed or capacity_refresh
 
             if refresh_needed:
+                # 在刷新LPMM系统前先进行全局内存清理
+                await self._force_global_memory_cleanup()
                 try:
                     from src.chat.knowledge import lpmm_start_up
                 except Exception:
@@ -1957,7 +2189,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     lpmm_start_up()
             if changed or capacity_changed:
                 await self._save_state(state)
-            
+
             # 运行结束后检查性能
             is_dangerous, desc = self._check_performance()
             if is_dangerous:
@@ -1980,8 +2212,19 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             def _load_count():
                 from src.chat.knowledge.kg_manager import KGManager
                 kg_manager = KGManager()
-                kg_manager.load_from_file()
-                return len(kg_manager.graph.get_node_list())
+                try:
+                    kg_manager.load_from_file()
+                    count = len(kg_manager.graph.get_node_list())
+                finally:
+                    # 确保清理KG管理器实例
+                    try:
+                        if hasattr(kg_manager, 'close'):
+                            kg_manager.close()
+                    except Exception:
+                        pass  # 忽略清理错误
+                    # 删除引用
+                    del kg_manager
+                return count
 
             count = await asyncio.to_thread(_load_count)
             self._cached_node_count = count
