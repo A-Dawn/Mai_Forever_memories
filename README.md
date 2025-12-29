@@ -6,6 +6,11 @@
 
 以下说明只涉及插件的部署和启动前置条件
 
+0. 安装插件所需依赖
+   - Win/Linux:在麦麦运行的虚拟环境下，在本文件夹执行pip install -r requirements.txt
+   - Win一键包:通过控制面板-安装依赖-选择文件选定当前目录下requirements.txt即可
+   - Docker:首先需要进入容器（输入docker exec -it maim-bot-core），通过cd定位到插件目录文件夹，再pip install -r requirements.txt即可
+   
 1. 插件配置（必须项）
    - 将插件中 `enabled`项目设置为 `true`
    - 确认插件配置文件 `plugins/mai_forever_memories/config.toml` 中 `plugin.enabled = true`
