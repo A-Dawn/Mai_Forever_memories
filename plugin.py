@@ -1512,7 +1512,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     try:
                         logger.warning("进程池提交失败 (%s)，改为以子进程脚本执行任务", exc)
                         # 写临时 JSON 输入文件
-                        import tempfile, json
+                        import tempfile
 
                         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as rawf:
                             rawf.write(json.dumps(raw_paragraphs, ensure_ascii=False))
