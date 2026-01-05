@@ -1,7 +1,6 @@
 #在使用此插件之前请务必注意！如果你是由于麦麦部署环境性能羸弱，将知识库在其他设备上生成并迁移到部署机的话，请谨慎使用本插件！
 #本插件在进行知识库处理时会进行导入/删除工作，可能对低配置服务端造成严重影响！
 
-
 [plugin]
 config_version = "1.0.0" # 配置版本
 enabled = false # 启用插件
@@ -15,7 +14,10 @@ enable_weekly = true # 启用每周摘要
 
 [streams]
 mode = "all" # 模式: all (处理所有流)，allow (仅处理 allowlist 中列出的流：白名单)，deny (处理除 denylist 以外的流：黑名单)
-allowlist = ["qq:123456789:private", "qq:987654321:group"] # 允许的流 ID 列表 (chat stream_id)，示例: "platform:id:private|group"
+allowlist = [
+    "qq:123456789:private",
+    "qq:987654321:group",
+] # 允许的流 ID 列表 (chat stream_id)，示例: "platform:id:private|group"
 denylist = ["qq:111222333:group"] # 拒绝的流 ID 列表 (chat stream_id)，示例: "platform:id:private|group"
 include_group = true # 包含群聊
 include_private = true # 包含私聊
@@ -27,16 +29,29 @@ max_input_chars = 8000 # 最大输入字符数
 daily_max_chars = 800 # 每日摘要长度
 weekly_max_chars = 1200 # 每周摘要长度
 level2_max_chars = 1600 # 最终压缩摘要长度
-forever_max_chars = 1000 # “永远的记忆”摘要长度
+forever_max_chars = 1000 # "永远的记忆"摘要长度
 temperature = 0.3 # LLM 温度
 filter_bot = false # 过滤机器人消息
 filter_command = true # 过滤命令消息
 truncate_messages = true # 截断长消息
+auto_import = true # 自动导入摘要到知识库
+confirm_import = false # 导入前是否需要管理员确认
+confirm_stream = "" # 发送确认消息的目标流ID，为空则使用performance.admin_id
+confirm_timeout = 300 # 确认超时时间（秒），超时后自动拒绝导入
+
+[viewpoint]
+enabled = false # 启用观点总结功能
+include_reply_style = true # 是否包含回复风格在主人设中
+max_chars = 500 # 观点总结最大长度
 
 [forever]
 enabled = true # 启用自然语言触发“永远的记忆”
 use_action = true # 启用 Action 模式触发永远的记忆
-keywords = ["请记住我们之间说的话哦", "一定不要忘记哦，一定不要", "永远不要忘记我们说的话哦"] # 触发关键词
+keywords = [
+    "请记住我们之间说的话哦",
+    "一定不要忘记哦，一定不要",
+    "永远不要忘记我们说的话哦",
+] # 触发关键词
 lookback_messages = 20 # 向上回溯的消息数量
 
 [capacity]
@@ -49,8 +64,8 @@ data_dir = "data/lpmm_summary" # 数据目录
 
 [performance]
 enabled = true # 启用性能检测
-max_cpu_percent = 80.0 # CPU 占用率阈值 (%)
-max_memory_percent = 85.0 # 内存占用率阈值 (%)
+max_cpu_percent = 80 # CPU 占用率阈值 (%)
+max_memory_percent = 85 # 内存占用率阈值 (%)
 admin_id = "qq:123456789:private" # 管理员标识: stream_id / platform:ID:private|group / 用户 ID
 alert_interval = 3600 # 告警间隔 (秒)
 

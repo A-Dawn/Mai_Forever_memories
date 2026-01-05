@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -90,6 +91,53 @@ def _extract_message_content(message) -> str:
             pass
 
     return ""
+
+
+class PendingConfirmTask:
+    """待确认导入任务的数据类"""
+
+    def __init__(self, task_id: str, task_type: str, chat_id: str, summary_text: str,
+                 raw_path: Path, openie_path: Path, created_at: float):
+        self.task_id = task_id
+        self.task_type = task_type  # "daily", "weekly", "forever"
+        self.chat_id = chat_id
+        self.summary_text = summary_text
+        self.raw_path = raw_path
+        self.openie_path = openie_path
+        self.created_at = created_at
+        self.confirm_timeout = created_at + 300  # 默认5分钟超时
+
+    def is_expired(self, current_time: float = None) -> bool:
+        """检查任务是否已过期"""
+        if current_time is None:
+            current_time = time.time()
+        return current_time >= self.confirm_timeout
+
+    def to_dict(self) -> dict:
+        """转换为字典格式，用于序列化"""
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "chat_id": self.chat_id,
+            "summary_text": self.summary_text,
+            "raw_path": str(self.raw_path),
+            "openie_path": str(self.openie_path),
+            "created_at": self.created_at,
+            "confirm_timeout": self.confirm_timeout,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'PendingConfirmTask':
+        """从字典格式创建实例"""
+        return cls(
+            task_id=data["task_id"],
+            task_type=data["task_type"],
+            chat_id=data["chat_id"],
+            summary_text=data["summary_text"],
+            raw_path=Path(data["raw_path"]),
+            openie_path=Path(data["openie_path"]),
+            created_at=data["created_at"],
+        )
 
 
 class MemoriesStartupHandler(BaseEventHandler):
@@ -334,7 +382,88 @@ class MemoriesCommand(BaseCommand):
             await self.send_text("已为此聊天立即生成永久的记忆。", storage_message=False)
             return True, None, False
 
-        await self.send_text("用法: /memories [status|list|show|delete|daily|weekly|now]", storage_message=False)
+        if action in ("summarize_daily", "summarize-daily"):
+            if not self.message.chat_stream:
+                await self.send_text("缺少聊天流。", storage_message=False)
+                return False, None, False
+            chat_id = self.message.chat_stream.stream_id if self.message.chat_stream else "unknown"
+            task_name = f"summarize_daily_{chat_id}"
+            _plugin_instance._create_tracked_task(
+                _plugin_instance.run_daily(streams=[self.message.chat_stream], manual=True, import_flag=False),
+                task_name=task_name
+            )
+            logger.info("已创建只总结每日摘要任务: %s", task_name)
+            await self.send_text("已为此聊天安排只总结的每日摘要任务。", storage_message=False)
+            return True, None, False
+
+        if action in ("summarize_weekly", "summarize-weekly"):
+            if not self.message.chat_stream:
+                await self.send_text("缺少聊天流。", storage_message=False)
+                return False, None, False
+            chat_id = self.message.chat_stream.stream_id if self.message.chat_stream else "unknown"
+            task_name = f"summarize_weekly_{chat_id}"
+            _plugin_instance._create_tracked_task(
+                _plugin_instance.run_weekly(streams=[self.message.chat_stream], manual=True, import_flag=False),
+                task_name=task_name
+            )
+            logger.info("已创建只总结每周摘要任务: %s", task_name)
+            await self.send_text("已为此聊天安排只总结的每周摘要任务。", storage_message=False)
+            return True, None, False
+
+        if action in ("summarize_now", "summarize-now"):
+            if not self.message.chat_stream:
+                await self.send_text("缺少聊天流。", storage_message=False)
+                return False, None, False
+
+            # 构造一个轻量的触发消息对象，供 run_forever 使用
+            class _FakeCommandMessage:
+                def __init__(self, chat_stream, command_self):
+                    self.chat_stream = chat_stream
+                    self._command_self = command_self
+
+                async def answer(self, text: str):
+                    # 使用命令实例提供的发送接口尝试回复（容错）
+                    try:
+                        await self._command_self.send_text(text, storage_message=False)
+                    except Exception:
+                        # 忽略发送错误
+                        pass
+
+            fm = _FakeCommandMessage(self.message.chat_stream, self)
+            chat_id = fm.chat_stream.stream_id if fm.chat_stream and hasattr(fm.chat_stream, "stream_id") else "unknown"
+            task_name = f"summarize_now_{chat_id}"
+            _plugin_instance._create_tracked_task(
+                _plugin_instance.run_forever(fm, import_flag=False),
+                task_name=task_name
+            )
+            logger.info("已创建只总结的即时记忆任务: %s", task_name)
+            await self.send_text("已为此聊天立即生成只总结的记忆。", storage_message=False)
+            return True, None, False
+
+        if action == "confirm":
+            if not _plugin_instance._is_admin_message(self.message):
+                await self.send_text("只有指定的管理员可以执行此操作。", storage_message=False)
+                return False, None, False
+
+            # 解析参数：/memories confirm <task_id> <yes/no>
+            parts = arg.split()
+            if len(parts) != 2:
+                await self.send_text("用法: /memories confirm <task_id> <yes/no>", storage_message=False)
+                return False, None, False
+
+            task_id, decision = parts
+            decision = decision.lower()
+
+            if decision not in ("yes", "no"):
+                await self.send_text("决策必须是 'yes' 或 'no'。", storage_message=False)
+                return False, None, False
+
+            # 执行确认操作
+            ok, msg = await _plugin_instance.handle_confirm_decision(task_id, decision == "yes")
+            await self.send_text(msg, storage_message=False)
+            return ok, None, False
+
+        await self.send_text("用法: /memories [status|list|show|delete|daily|weekly|now|summarize-daily|summarize-weekly|summarize-now|confirm]", storage_message=False)
         return True, None, False
 
 
@@ -395,6 +524,15 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             "filter_bot": ConfigField(type=bool, default=False, description="过滤机器人消息"),
             "filter_command": ConfigField(type=bool, default=True, description="过滤命令消息"),
             "truncate_messages": ConfigField(type=bool, default=True, description="截断长消息"),
+            "auto_import": ConfigField(type=bool, default=True, description="自动导入摘要到知识库"),
+            "confirm_import": ConfigField(type=bool, default=False, description="导入前是否需要管理员确认"),
+            "confirm_stream": ConfigField(type=str, default="", description="发送确认消息的目标流ID，为空则使用performance.admin_id"),
+            "confirm_timeout": ConfigField(type=int, default=300, description="确认超时时间（秒），超时后自动拒绝导入"),
+        },
+        "viewpoint": {
+            "enabled": ConfigField(type=bool, default=False, description="启用观点总结功能"),
+            "include_reply_style": ConfigField(type=bool, default=True, description="是否包含回复风格在主人设中"),
+            "max_chars": ConfigField(type=int, default=500, description="观点总结最大长度"),
         },
         "forever": {
             "enabled": ConfigField(type=bool, default=True, description="启用自然语言触发"),
@@ -456,6 +594,9 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         self._openie_dir = self._data_dir / "openie"
         self._delete_dir = self._data_dir / "delete"
         self._state_path = self._data_dir / "state.json"
+        # 待确认导入任务管理
+        self._pending_confirm_tasks: dict[str, dict] = {}
+        self._pending_tasks_lock = asyncio.Lock()
         _plugin_instance = self
 
     def get_plugin_components(self) -> list[tuple[ComponentInfo, type]]:
@@ -737,6 +878,8 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                 await self._run_due()
                 # 定期清理已完成的任务
                 await self._cleanup_finished_tasks()
+                # 清理过期的待确认任务
+                await self._cleanup_expired_confirm_tasks()
                 
                 next_run = self._next_scheduled_run()
                 if next_run is None:
@@ -1135,7 +1278,10 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             "9. 明确标注关键时间节点和事件发生的具体时间点。\n"
             "10. 强化实体间关系的表达，明确说明'谁对谁做了什么'或'谁与谁的关系如何'。\n"
             "11. 使用具体的实体名称，避免模糊指代，使用'具体人名'而非'某人'或'成员'。\n"
-            "12. 突出重要决策、达成共识和后续行动计划，这些是知识库最有价值的信息。\n\n"
+            "12. 突出重要决策、达成共识和后续行动计划，这些是知识库最有价值的信息。\n"
+            "13. 对于固定的事实内容（如歌词、特定短语、诗句等），使用特殊标记保留原始格式：\n"
+            "    [ORIGINAL:标签]原始内容[/ORIGINAL]\n"
+            "    例如：[ORIGINAL:副歌]天空之城，永远的传说[/ORIGINAL]\n\n"
             "内容:\n"
             f"{content}\n"
         )
@@ -1144,21 +1290,234 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         """对摘要进行预处理，确保符合 LPMM 的分段要求。"""
         # 统一换行符并去除多余空白
         lines = [line.strip() for line in text.splitlines()]
-        # 过滤掉空行，然后用双换行连接非空行（如果 LLM 没按要求做，我们强制做）
-        # 但更好的做法是识别原本的段落。这里我们假设 LLM 输出的每一行或连续行是一个意群。
-        # 简单的逻辑：合并连续的非空行，段落间留空行。
+
+        # 特殊处理：保留原始内容的标记
         paragraphs = []
         current_para = []
+        in_original_block = False
+
         for line in lines:
-            if line:
+            if line.startswith('[ORIGINAL:'):
+                # 开始原始内容块，保持原格式
+                if current_para:
+                    paragraphs.append(" ".join(current_para))
+                    current_para = []
+                in_original_block = True
+                # 保留原始标记
+                paragraphs.append(line)
+            elif line.startswith('[/ORIGINAL]'):
+                # 结束原始内容块
+                in_original_block = False
+                paragraphs.append(line)
+            elif in_original_block:
+                # 在原始内容块内，保持原始格式
+                paragraphs.append(line)
+            elif line:
                 current_para.append(line)
             elif current_para:
                 paragraphs.append(" ".join(current_para))
                 current_para = []
+
         if current_para:
             paragraphs.append(" ".join(current_para))
-        
+
         return "\n\n".join(paragraphs)
+
+    def _format_lyrics_with_original_preservation(self, lyrics_data: dict) -> str:
+        """专门处理歌词内容，保留原始格式的同时添加结构化描述"""
+        formatted_parts = []
+
+        # 歌曲基本信息
+        if 'title' in lyrics_data:
+            formatted_parts.append(f"歌曲《{lyrics_data['title']}》")
+
+        if 'artist' in lyrics_data:
+            formatted_parts.append(f"由{lyrics_data['artist']}演唱")
+
+        if 'genre' in lyrics_data:
+            formatted_parts.append(f"是一首{lyrics_data['genre']}风格歌曲")
+
+        formatted_parts.append("")  # 空行分隔
+
+        # 处理歌词结构
+        if 'structure' in lyrics_data:
+            for section in lyrics_data['structure']:
+                section_type = section.get('type', 'lyrics')
+                content = section.get('content', '')
+
+                if section_type == 'original':
+                    # 保留原始歌词格式
+                    formatted_parts.append(f"[ORIGINAL:{section.get('label', '歌词')}]")
+                    # 保持原始断句和格式
+                    formatted_parts.append(content)
+                    formatted_parts.append("[/ORIGINAL]")
+                else:
+                    # 结构化描述
+                    formatted_parts.append(f"[{section_type.upper()}]")
+                    formatted_parts.append(content)
+
+                formatted_parts.append("")  # 段落分隔
+
+        # 整体分析
+        if 'analysis' in lyrics_data:
+            formatted_parts.append("整体分析：")
+            for key, value in lyrics_data['analysis'].items():
+                formatted_parts.append(f"{key}：{value}")
+            formatted_parts.append("")  # 空行分隔
+
+        return "\n\n".join(formatted_parts)
+
+    def _extract_entities_from_lyrics(self, text: str) -> tuple[list, list]:
+        """从歌词内容中提取实体和三元组，保留原始内容特征"""
+        import re
+
+        # 解析原始内容标记
+        original_pattern = r'\[ORIGINAL:([^\]]+)\](.*?)\[/ORIGINAL\]'
+        entities = []
+        triples = []
+
+        # 分离原始内容和描述性内容
+        original_blocks = []
+        clean_text_parts = []
+
+        # 提取所有原始内容块
+        last_end = 0
+        for match in re.finditer(original_pattern, text, re.DOTALL):
+            # 添加标记前的文本
+            clean_text_parts.append(text[last_end:match.start()])
+
+            label = match.group(1)
+            content = match.group(2).strip()
+            original_blocks.append((label, content))
+
+            last_end = match.end()
+
+        # 添加最后一部分文本
+        clean_text_parts.append(text[last_end:])
+
+        # 合并非原始内容的文本
+        clean_text = ''.join(clean_text_parts).strip()
+
+        # 对描述性内容进行标准实体提取
+        if clean_text:
+            try:
+                from src.llm_models.utils_model import LLMRequest
+                from src.chat.knowledge.ie_process import info_extract_from_str
+                import model_config
+
+                ner_llm = LLMRequest(
+                    model_set=model_config.model_task_config.lpmm_entity_extract,
+                    request_type="memories.lpmm.ner",
+                )
+                rdf_llm = LLMRequest(
+                    model_set=model_config.model_task_config.lpmm_rdf_build,
+                    request_type="memories.lpmm.rdf",
+                )
+
+                desc_entities, desc_triples = info_extract_from_str(ner_llm, rdf_llm, clean_text)
+                if desc_entities:
+                    entities.extend(desc_entities)
+                if desc_triples:
+                    triples.extend(desc_triples)
+            except Exception as e:
+                logger.warning("描述性内容实体提取失败: %s", e)
+
+        # 为原始内容块创建结构化实体和三元组
+        for label, content in original_blocks:
+            # 创建表示原始内容的实体
+            content_entity = f"原始内容_{label}_{hash(content) % 10000}"
+            entities.append(content_entity)
+
+            # 创建描述性三元组
+            triples.append({
+                "subject": content_entity,
+                "predicate": "属于类型",
+                "object": label
+            })
+
+            triples.append({
+                "subject": content_entity,
+                "predicate": "包含内容",
+                "object": content[:100] + "..." if len(content) > 100 else content
+            })
+
+        return entities, triples
+
+    def _build_personality_prompt(self) -> str:
+        """构建主人设提示，用于观点总结。"""
+        bot_name = global_config.bot.nickname
+        if global_config.bot.alias_names:
+            bot_nickname = f",也有人叫你{','.join(global_config.bot.alias_names)}"
+        else:
+            bot_nickname = ""
+
+        # 获取基础personality
+        prompt_personality = global_config.personality.personality
+
+        # 检查是否需要随机替换为状态
+        if (
+            global_config.personality.states
+            and global_config.personality.state_probability > 0
+            and random.random() < global_config.personality.state_probability
+        ):
+            # 随机选择一个状态替换personality
+            selected_state = random.choice(global_config.personality.states)
+            prompt_personality = selected_state
+
+        prompt_personality = f"{prompt_personality};"
+
+        # 根据配置决定是否包含回复风格
+        include_reply_style = self.get_config("viewpoint.include_reply_style", True)
+        if include_reply_style and global_config.personality.reply_style:
+            reply_style = global_config.personality.reply_style
+            return f"你的名字是{bot_name}{bot_nickname}，你{prompt_personality}你的回复风格是：{reply_style}"
+        else:
+            return f"你的名字是{bot_name}{bot_nickname}，你{prompt_personality}"
+
+    async def _generate_viewpoint_summary(self, original_summary: str, title: str) -> str:
+        """基于主人设生成观点总结。"""
+        if not original_summary.strip():
+            return ""
+
+        # 检查是否启用观点总结
+        if not self.get_config("viewpoint.enabled", False):
+            return ""
+
+        personality_prompt = self._build_personality_prompt()
+        max_chars = self.get_config("viewpoint.max_chars", 500)
+
+        prompt = (
+            f"{personality_prompt}\n\n"
+            "请基于以上的人设，对下面的聊天记录摘要进行观点总结。\n"
+            "要求：\n"
+            "1. 以第一人称表达我的观点和感受\n"
+            "2. 重点关注这段对话中的重要内容和我个人的反应\n"
+            "3. 格式清晰，使用中小段落，避免过长的句子\n"
+            "4. 保持温暖、真实的语气\n"
+            "5. 控制在 {max_chars} 字符以内\n\n"
+            f"聊天记录摘要：\n{original_summary}\n\n"
+            "观点总结："
+        )
+
+        task_config = self._get_task_config()
+        temperature = self.get_config("summary.temperature", 0.7)  # 观点总结使用稍高的温度
+        ok, response, _, model_name = await llm_api.generate_with_model(
+            prompt,
+            task_config,
+            request_type=f"memories.viewpoint.{title}",
+            temperature=temperature,
+        )
+        if not ok:
+            logger.error("%s 的观点总结 LLM 调用失败。", title)
+            return ""
+        viewpoint = response.strip()
+        if not viewpoint:
+            logger.warning("%s 的观点总结为空。", title)
+            return ""
+
+        viewpoint = self._truncate_text(viewpoint, max_chars)
+        logger.info("已生成观点总结 (%s)，使用模型 %s。", title, model_name)
+        return viewpoint
 
     async def _summarize_text(self, content: str, max_chars: int, title: str) -> str:
         if not content.strip():
@@ -1189,7 +1548,13 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         # 预处理分段
         summary = self._preprocess_summary_for_lpmm(summary)
         summary = self._truncate_text(summary, max_chars)
-        
+
+        # 生成观点总结（如果启用）
+        viewpoint_summary = await self._generate_viewpoint_summary(summary, title)
+        if viewpoint_summary:
+            # 将观点总结附加到原始摘要后
+            summary = f"{summary}\n\n观点总结：\n{viewpoint_summary}"
+
         logger.info("已生成摘要 (%s)，使用模型 %s。", title, model_name)
         return summary
 
@@ -1226,6 +1591,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         end_ts: float,
         max_chars: int,
         tz,
+        import_flag: bool = True,
     ) -> dict | None:
         self._ensure_dirs()
         # 按需导入 hash 函数，避免在模块导入时加载大型依赖
@@ -1259,19 +1625,43 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             logger.error("写入原始文件失败: %s, 路径: %s", exc, raw_path, exc_info=True)
             return None
         
-        # 导入到 LPMM，如果失败则清理已写入的文件
-        ok = await self._import_raw_summary(raw_path, openie_path)
-        if not ok:
-            # 清理已写入的文件，避免残留
-            try:
-                def _cleanup():
-                    if raw_path.exists():
-                        raw_path.unlink()
-                await asyncio.to_thread(_cleanup)
-                logger.debug("已清理失败的原始文件: %s", raw_path)
-            except Exception as cleanup_exc:
-                logger.warning("清理失败文件时出错: %s", cleanup_exc)
-            return None
+        # 检查是否需要确认导入
+        confirm_import = bool(self.get_config("summary.confirm_import", False))
+        if import_flag and confirm_import:
+            # 需要确认导入，创建待确认任务
+            task_id = f"{kind}_{safe_id}_{stamp}"
+            task = PendingConfirmTask(
+                task_id=task_id,
+                task_type=kind,
+                chat_id=chat_id,
+                summary_text=summary,
+                raw_path=raw_path,
+                openie_path=openie_path,
+                created_at=created_at,
+            )
+            # 设置确认超时时间
+            confirm_timeout = int(self.get_config("summary.confirm_timeout", 300))
+            task.confirm_timeout = created_at + confirm_timeout
+
+            await self._add_pending_confirm_task(task)
+            await self._send_confirm_message(task)
+            logger.info("摘要已保存，等待管理员确认导入: %s", task_id)
+        elif import_flag:
+            # 直接导入
+            ok = await self._import_raw_summary(raw_path, openie_path)
+            if not ok:
+                # 清理已写入的文件，避免残留
+                try:
+                    def _cleanup():
+                        if raw_path.exists():
+                            raw_path.unlink()
+                    await asyncio.to_thread(_cleanup)
+                    logger.debug("已清理失败的原始文件: %s", raw_path)
+                except Exception as cleanup_exc:
+                    logger.warning("清理失败文件时出错: %s", cleanup_exc)
+                return None
+        else:
+            logger.info("跳过知识库导入，仅保存摘要文件: %s", raw_path)
         summary_hash = get_sha256(full_text)
         entry_id = f"{kind}-{safe_id}-{stamp}-{summary_hash[:8]}"
         return {
@@ -1400,8 +1790,18 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             request_type="memories.lpmm.rdf",
         )
 
-        # 3. 执行信息提取（可能包含重试与 time.sleep）
-        entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
+        # 3. 预处理文本：识别原始内容并进行特殊处理
+        has_original_content = '[ORIGINAL:' in text
+
+        if has_original_content:
+            # 对于包含原始内容的文本，使用增强的实体提取逻辑
+            entities, triples = self._extract_entities_from_lyrics(text)
+            if not entities or not triples:
+                # 如果增强提取失败，回退到标准提取
+                entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
+        else:
+            # 标准信息提取
+            entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
         if entities is None or triples is None:
             logger.error("LPMM 信息提取失败。")
             return False
@@ -1615,7 +2015,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             weekly_anchor = self._weekly_anchor(now)
             await self.run_weekly(streams=streams, manual=False, anchor=weekly_anchor)
 
-    async def run_forever(self, trigger_message: MaiMessages) -> None:
+    async def run_forever(self, trigger_message: MaiMessages, import_flag: bool = True) -> None:
         """手动触发的"永远的记忆"逻辑。"""
         chat_id = None
         try:
@@ -1682,6 +2082,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     end_ts=end_ts,
                     max_chars=forever_max_chars,
                     tz=self._get_timezone(),
+                    import_flag=import_flag,
                 )
                 
                 if entry:
@@ -1720,7 +2121,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             except Exception as e:
                 logger.warning("发送错误通知失败: %s", e)
 
-    async def run_daily(self, streams=None, manual: bool = False, anchor: datetime | None = None) -> None:
+    async def run_daily(self, streams=None, manual: bool = False, anchor: datetime | None = None, import_flag: bool = True) -> None:
         if not self._is_enabled():
             return
         if not self._lpmm_enabled():
@@ -1755,6 +2156,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             filter_bot = bool(self.get_config("summary.filter_bot", False))
             filter_command = bool(self.get_config("summary.filter_command", True))
             truncate_messages = bool(self.get_config("summary.truncate_messages", True))
+            auto_import = import_flag if manual else bool(self.get_config("summary.auto_import", True))
 
             for stream in target_streams:
                 chat_id = getattr(stream, "stream_id", None)
@@ -1808,6 +2210,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     end_ts=end_ts,
                     max_chars=daily_max_chars,
                     tz=tz,
+                    import_flag=auto_import,
                 )
                 if not entry:
                     continue
@@ -1834,7 +2237,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             if is_dangerous:
                 await self._alert_admin(desc)
 
-    async def run_weekly(self, streams=None, manual: bool = False, anchor: datetime | None = None) -> None:
+    async def run_weekly(self, streams=None, manual: bool = False, anchor: datetime | None = None, import_flag: bool = True) -> None:
         if not self._is_enabled():
             return
         if not manual and not bool(self.get_config("schedule.enable_weekly", True)):
@@ -1867,6 +2270,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
 
             max_input_chars = int(self.get_config("summary.max_input_chars", 8000))
             weekly_max_chars = int(self.get_config("summary.weekly_max_chars", 1200))
+            auto_import = import_flag if manual else bool(self.get_config("summary.auto_import", True))
 
             for stream in target_streams:
                 chat_id = getattr(stream, "stream_id", None)
@@ -1917,6 +2321,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
                     end_ts=end_ts,
                     max_chars=weekly_max_chars,
                     tz=tz,
+                    import_flag=auto_import,
                 )
                 if not entry:
                     continue
@@ -2174,6 +2579,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         tz = self._get_timezone()
         max_input_chars = int(self.get_config("summary.max_input_chars", 8000))
         level2_max_chars = int(self.get_config("summary.level2_max_chars", 1600))
+        auto_import = bool(self.get_config("summary.auto_import", True))
         entries_text = await self._build_entries_text(selected_entries, tz)
         entries_text = self._truncate_text(entries_text, max_input_chars)
         summary = await self._summarize_text(entries_text, level2_max_chars, "level2")
@@ -2194,6 +2600,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             end_ts=end_ts,
             max_chars=level2_max_chars,
             tz=tz,
+            import_flag=auto_import,
         )
         if not entry:
             return False, False
@@ -2201,3 +2608,201 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         state.setdefault("finalized_level2", {})[selected_chat] = True
         await self._delete_entries(selected_entries)
         return True, True
+
+    # ===== 待确认导入任务管理方法 =====
+
+    async def _add_pending_confirm_task(self, task: PendingConfirmTask) -> None:
+        """添加待确认导入任务"""
+        async with self._pending_tasks_lock:
+            self._pending_confirm_tasks[task.task_id] = task.to_dict()
+            logger.info("添加待确认导入任务: %s (%s)", task.task_id, task.task_type)
+
+    async def _get_pending_confirm_task(self, task_id: str) -> PendingConfirmTask | None:
+        """获取待确认导入任务"""
+        async with self._pending_tasks_lock:
+            task_data = self._pending_confirm_tasks.get(task_id)
+            if task_data:
+                return PendingConfirmTask.from_dict(task_data)
+            return None
+
+    async def _remove_pending_confirm_task(self, task_id: str) -> PendingConfirmTask | None:
+        """移除待确认导入任务"""
+        async with self._pending_tasks_lock:
+            task_data = self._pending_confirm_tasks.pop(task_id, None)
+            if task_data:
+                task = PendingConfirmTask.from_dict(task_data)
+                logger.info("移除待确认导入任务: %s (%s)", task.task_id, task.task_type)
+                return task
+            return None
+
+    async def _cleanup_expired_confirm_tasks(self) -> list[PendingConfirmTask]:
+        """清理过期的待确认任务，返回被清理的任务列表"""
+        current_time = time.time()
+        expired_tasks = []
+
+        async with self._pending_tasks_lock:
+            task_ids_to_remove = []
+            for task_id, task_data in self._pending_confirm_tasks.items():
+                task = PendingConfirmTask.from_dict(task_data)
+                if task.is_expired(current_time):
+                    task_ids_to_remove.append(task_id)
+                    expired_tasks.append(task)
+
+            for task_id in task_ids_to_remove:
+                self._pending_confirm_tasks.pop(task_id, None)
+                logger.info("清理过期待确认导入任务: %s", task_id)
+
+        # 对过期任务执行默认行为（拒绝导入，清理文件）
+        for task in expired_tasks:
+            try:
+                await self._cleanup_task_files(task)
+                logger.info("过期任务 %s 已自动拒绝并清理文件", task.task_id)
+            except Exception as e:
+                logger.error("清理过期任务文件失败: %s", e)
+
+        return expired_tasks
+
+    async def handle_confirm_decision(self, task_id: str, approved: bool) -> tuple[bool, str]:
+        """处理管理员的确认决策"""
+        try:
+            task = await self._get_pending_confirm_task(task_id)
+            if not task:
+                return False, f"未找到待确认任务: {task_id}"
+
+            # 移除待确认任务
+            await self._remove_pending_confirm_task(task_id)
+
+            if approved:
+                # 执行导入
+                ok = await self._import_raw_summary(task.raw_path, task.openie_path)
+                if ok:
+                    # 导入成功，创建状态条目
+                    state = await self._load_state()
+                    summary_hash = self._calculate_summary_hash(task.summary_text, task.chat_id, task.created_at)
+
+                    # 构建状态条目（简化版）
+                    entry = {
+                        "id": f"{task.task_type}-{task.chat_id.replace('/', '_')}-{int(task.created_at)}-{summary_hash[:8]}",
+                        "chat_id": task.chat_id,
+                        "kind": task.task_type,
+                        "level": 0,
+                        "hash": summary_hash,
+                        "raw_file": self._relpath(task.raw_path),
+                        "openie_file": self._relpath(task.openie_path),
+                        "created_at": task.created_at,
+                        "source_start": task.created_at - 86400,  # 简化处理
+                        "source_end": task.created_at,
+                        "deleted": False,
+                    }
+                    state["entries"].append(entry)
+                    await self._save_state(state)
+
+                    return True, f"✅ 已确认导入任务 {task_id}，并成功导入到知识库"
+                else:
+                    # 导入失败，清理文件
+                    await self._cleanup_task_files(task)
+                    return False, f"❌ 任务 {task_id} 导入失败，已清理文件"
+            else:
+                # 拒绝导入，清理文件
+                await self._cleanup_task_files(task)
+                return True, f"❌ 已拒绝导入任务 {task_id}，已清理文件"
+
+        except Exception as e:
+            logger.error("处理确认决策失败: %s", e, exc_info=True)
+            return False, f"处理确认决策时发生错误: {str(e)}"
+
+    async def _cleanup_task_files(self, task: PendingConfirmTask) -> None:
+        """清理任务相关的文件"""
+        try:
+            def _cleanup():
+                if task.raw_path.exists():
+                    task.raw_path.unlink()
+                if task.openie_path.exists():
+                    task.openie_path.unlink()
+
+            await asyncio.to_thread(_cleanup)
+            logger.debug("已清理任务文件: %s", task.task_id)
+        except Exception as e:
+            logger.warning("清理任务文件失败: %s", e)
+
+    def _calculate_summary_hash(self, summary_text: str, chat_id: str, created_at: float) -> str:
+        """计算摘要的哈希值"""
+        try:
+            from src.chat.knowledge.utils.hash import get_sha256
+        except Exception:
+            import hashlib
+            def get_sha256(text: str) -> str:
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        # 构建与_persist_summary相同的文本格式
+        meta = f"聊天会话 {chat_id} (确认导入)"
+        full_text = f"{meta}\n\n{summary_text}"
+        return get_sha256(full_text)
+
+    async def _send_confirm_message(self, task: PendingConfirmTask) -> None:
+        """发送确认导入消息给管理员"""
+        try:
+            # 获取确认消息的目标流
+            confirm_stream = self.get_config("summary.confirm_stream", "").strip()
+            if not confirm_stream:
+                confirm_stream = self.get_config("performance.admin_id", "").strip()
+
+            if not confirm_stream:
+                logger.warning("未配置确认消息目标流，跳过发送确认消息")
+                return
+
+            # 生成简短的记忆总结
+            short_summary = self._generate_short_summary(task.summary_text)
+
+            # 构建确认消息
+            task_type_name = {
+                "daily": "每日摘要",
+                "weekly": "每周摘要",
+                "forever": "永久记忆"
+            }.get(task.task_type, task.task_type)
+
+            message_lines = [
+                f"📝 **新的{task_type_name}等待确认导入**",
+                f"任务ID: `{task.task_id}`",
+                f"聊天: `{task.chat_id}`",
+                f"时间: {datetime.fromtimestamp(task.created_at).strftime('%Y-%m-%d %H:%M:%S')}",
+                "",
+                "📄 **简短总结**:",
+                short_summary,
+                "",
+                "⚠️  请确认是否导入此记忆到知识库：",
+                f"同意导入: `/memories confirm {task.task_id} yes`",
+                f"拒绝导入: `/memories confirm {task.task_id} no`",
+                "",
+                f"⏰ 此确认将在 {int((task.confirm_timeout - task.created_at) / 60)} 分钟后自动过期"
+            ]
+
+            message = "\n".join(message_lines)
+
+            # 发送消息
+            await send_api.send_text_message(confirm_stream, message)
+            logger.info("已发送确认消息到 %s: %s", confirm_stream, task.task_id)
+
+        except Exception as e:
+            logger.error("发送确认消息失败: %s", e, exc_info=True)
+
+    def _generate_short_summary(self, summary_text: str, max_length: int = 200) -> str:
+        """生成简短的记忆总结"""
+        if len(summary_text) <= max_length:
+            return summary_text
+
+        # 尝试在句子边界截断
+        truncated = summary_text[:max_length]
+        last_sentence_end = max(
+            truncated.rfind('。'),
+            truncated.rfind('！'),
+            truncated.rfind('？'),
+            truncated.rfind('. '),
+            truncated.rfind('! '),
+            truncated.rfind('? ')
+        )
+
+        if last_sentence_end > max_length * 0.7:  # 如果句子结束位置合理
+            return summary_text[:last_sentence_end + 1] + "..."
+        else:
+            return truncated + "..."

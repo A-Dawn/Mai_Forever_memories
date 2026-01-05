@@ -2,6 +2,35 @@
 
 本文件记录了 Mai Forever Memories 插件的所有重要变更。
 
+## [0.2.0] - 2025-01-04
+
+### 新增
+- **只总结不导入模式**: 新增 `summarize_*` 命令系列，允许仅生成摘要而不导入知识库
+  - `/memories summarize_daily`: 仅总结每日摘要
+  - `/memories summarize_weekly`: 仅总结每周摘要
+  - `/memories summarize_now`: 仅总结永久记忆
+- **确认导入机制**: 新增导入确认功能，在导入摘要到知识库前向管理员发送确认请求
+  - `/memories confirm <task_id> <yes/no>`: 管理员确认或拒绝待导入任务
+  - 支持超时自动拒绝机制
+  - 可配置确认消息的目标流和超时时间
+
+### 配置项新增
+- `summary.auto_import`: 是否自动导入摘要到知识库（默认 `true`）
+- `summary.confirm_import`: 是否启用导入确认机制（默认 `false`）
+- `summary.confirm_stream`: 发送确认消息的目标流ID（默认为空，使用 `performance.admin_id`）
+- `summary.confirm_timeout`: 确认超时时间（秒，默认 `300`）
+
+### 优化
+- **配置格式化**: 改进了 `allowlist` 和 `keywords` 的数组格式
+- **数值格式**: 移除了 CPU 和内存阈值后的 `.0` 后缀
+
+### 技术细节
+- **版本升级**: 从 0.1.3 升级到 0.2.0
+- **代码重构**: 大幅重构 plugin.py，新增 631 行代码，修改 26 行
+- **向下兼容**: 保持与上游仓库的兼容性，新功能均为可选
+
+---
+
 ## [0.1.3] - 2025-12-29
 
 ### 新增
