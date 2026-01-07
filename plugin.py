@@ -2780,7 +2780,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             message = "\n".join(message_lines)
 
             # 发送消息
-            await send_api.send_text_message(confirm_stream, message)
+            await send_api.send_text_message(confirm_stream, message, storage_message=False)
             logger.info("已发送确认消息到 %s: %s", confirm_stream, task.task_id)
 
         except Exception as e:
