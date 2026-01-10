@@ -1,3 +1,9 @@
+0.2.2 ✅️
+✅️ 定时导入功能修复: 修复定时摘要无法自动导入到LPMM知识库的问题
+✅️ 子进程模块导入: 在_import_raw_summary_blocking方法中添加model_config导入
+✅️ 子进程脚本导入路径: 修正subprocess_worker.py中的导入路径为src.chat.knowledge
+✅️ 配置修复: 修复auto_import配置设置，确保自动导入功能正常工作
+
 0.1.3 ✅️
 ✅️ 依赖管理: 添加 requirements.txt 文件，引入 psutil>=5.9.0 依赖，用于性能监控功能
 ✅️ 子进程工作脚本: 新增 subprocess_worker.py，独立的子进程脚本用于执行知识库重建任务，避免Pickling问题

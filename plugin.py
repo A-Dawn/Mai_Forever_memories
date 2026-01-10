@@ -1756,6 +1756,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             "src.chat.knowledge.utils.hash",
         ]
         try:
+            from src.config.config import global_config, model_config
             from src.llm_models.utils_model import LLMRequest
             from src.chat.knowledge.ie_process import info_extract_from_str
             from src.chat.knowledge.open_ie import OpenIE
@@ -1803,8 +1804,12 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             # 标准信息提取
             entities, triples = info_extract_from_str(ner_llm, rdf_llm, text)
         if entities is None or triples is None:
-            logger.error("LPMM 信息提取失败。")
+            logger.error("LPMM 信息提取失败。entities=%s, triples=%s", entities, triples)
             return False
+
+        logger.debug("信息提取结果: entities类型=%s, 长度=%s, triples类型=%s, 长度=%s",
+                    type(entities), len(entities) if hasattr(entities, '__len__') else 'N/A',
+                    type(triples), len(triples) if hasattr(triples, '__len__') else 'N/A')
 
         # 4. 构建 OpenIE 对象并保存中间文件
         pg_hash = get_sha256(text)
@@ -2000,6 +2005,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
 
     async def _run_due(self) -> None:
         if not self._is_enabled():
+            logger.debug("_run_due: 插件未启用，跳过")
             return
         if not self._lpmm_enabled():
             logger.info("LPMM 已禁用；跳过摘要。")
@@ -2007,12 +2013,16 @@ class MaiForeverMemoriesPlugin(BasePlugin):
         tz = self._get_timezone()
         now = datetime.now(tz)
         streams = self._select_streams()
+        logger.info("_run_due: 调度器运行中，当前时间: %s, 找到 %d 个流", now.strftime("%H:%M:%S"), len(streams))
         if not streams:
+            logger.debug("_run_due: 没有找到符合条件的流")
             return
         daily_anchor = self._daily_anchor(now)
+        logger.info("_run_due: 执行每日摘要，锚点时间: %s", daily_anchor.strftime("%H:%M:%S"))
         await self.run_daily(streams=streams, manual=False, anchor=daily_anchor)
         if bool(self.get_config("schedule.enable_weekly", True)):
             weekly_anchor = self._weekly_anchor(now)
+            logger.info("_run_due: 执行每周摘要，锚点时间: %s", weekly_anchor.strftime("%H:%M:%S"))
             await self.run_weekly(streams=streams, manual=False, anchor=weekly_anchor)
 
     async def run_forever(self, trigger_message: MaiMessages, import_flag: bool = True) -> None:

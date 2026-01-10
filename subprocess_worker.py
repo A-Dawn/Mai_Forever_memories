@@ -36,8 +36,8 @@ def rebuild_and_build_in_subprocess(raw_paragraphs: dict, triple_list_data: dict
             sys.path.insert(0, project_root_str)
 
         # 导入必要的模块
-        from chat.knowledge.embedding_store import EmbeddingManager
-        from chat.knowledge.kg_manager import KGManager
+        from src.chat.knowledge.embedding_store import EmbeddingManager
+        from src.chat.knowledge.kg_manager import KGManager
 
         embed_manager = EmbeddingManager()
         try:

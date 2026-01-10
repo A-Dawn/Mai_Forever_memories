@@ -2,6 +2,24 @@
 
 本文件记录了 Mai Forever Memories 插件的所有重要变更。
 
+## [0.2.2] - 2026-01-10
+
+### 修复
+- **定时导入功能失效**: 修复定时摘要无法自动导入到LPMM知识库的问题
+  - 问题1：子进程中缺少 `model_config` 模块导入，导致 `ModuleNotFoundError`
+  - 修复1：在 `_import_raw_summary_blocking` 方法中添加 `from src.config.config import global_config, model_config` 导入
+  - 问题2：子进程脚本 `subprocess_worker.py` 中使用错误的导入路径 `chat.knowledge` 而不是 `src.chat.knowledge`
+  - 修复2：修正子进程脚本中的导入路径为 `src.chat.knowledge`
+- **配置问题**: 修复配置文件中 `auto_import = false` 导致的导入禁用问题
+  - 将 `summary.auto_import` 设置为 `true` 以启用自动导入功能
+
+### 技术细节
+- **版本升级**: 从 0.2.1 升级到 0.2.2
+- **代码变更**: 修改 2 个文件，添加必要的模块导入
+- **配置修复**: 修复自动导入功能的配置设置
+
+---
+
 ## [0.2.1] - 2026-01-07
 
 ### 修复
