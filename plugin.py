@@ -1403,7 +1403,7 @@ class MaiForeverMemoriesPlugin(BasePlugin):
             try:
                 from src.llm_models.utils_model import LLMRequest
                 from src.chat.knowledge.ie_process import info_extract_from_str
-                import model_config
+                # model_config 在文件顶部已导入，无需重新导入
 
                 ner_llm = LLMRequest(
                     model_set=model_config.model_task_config.lpmm_entity_extract,
